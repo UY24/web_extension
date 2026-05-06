@@ -55,6 +55,14 @@ export interface JobResult {
   details?: PageResult
 }
 
+export interface RunState {
+  running: boolean
+  stopRequested: boolean
+  startedAt: number | null
+  trigger: 'manual' | 'scheduled' | null
+  tabId?: number
+}
+
 export type QBOEnvironment = 'sandbox' | 'production'
 
 export interface Settings {

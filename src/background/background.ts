@@ -1,5 +1,5 @@
 import { DEFAULT_SETTINGS } from '../types'
-import type { JobResult, PageResult, Settings } from '../types'
+import type { JobResult, PageResult, RunState, Settings } from '../types'
 
 const QBO_TARGETS: Record<Settings['qboEnvironment'], { openUrl: string; tabMatchUrl: string; label: string }> = {
   sandbox: {
@@ -14,6 +14,22 @@ const QBO_TARGETS: Record<Settings['qboEnvironment'], { openUrl: string; tabMatc
   },
 }
 const ALARM_NAME = 'qbo-daily-run'
+type ActiveRun = {
+  id: string
+  startedAt: number
+  trigger: 'manual' | 'scheduled'
+  tabId?: number
+  stopRequested: boolean
+}
+
+const IDLE_RUN_STATE: RunState = {
+  running: false,
+  stopRequested: false,
+  startedAt: null,
+  trigger: null,
+}
+
+let activeRun: ActiveRun | null = null
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -58,14 +74,63 @@ function setBadge(text: string, color = '#2ca01c') {
   chrome.action.setBadgeBackgroundColor({ color })
 }
 
+async function setRunState(state: RunState) {
+  await chrome.storage.local.set({ runState: state })
+}
+
+async function clearRunState() {
+  await setRunState(IDLE_RUN_STATE)
+}
+
+async function markRunning(run: ActiveRun) {
+  await setRunState({
+    running: true,
+    stopRequested: run.stopRequested,
+    startedAt: run.startedAt,
+    trigger: run.trigger,
+    tabId: run.tabId,
+  })
+  setBadge(run.stopRequested ? 'STOP' : 'RUN', run.stopRequested ? '#D97706' : '#00A3E0')
+  await chrome.action.setTitle({
+    title: run.stopRequested ? 'QBO Categorizer stopping...' : 'QBO Categorizer running...',
+  })
+}
+
+function makeInProgressResult(trigger: 'manual' | 'scheduled'): JobResult {
+  return {
+    ok: false,
+    trigger,
+    timestamp: Date.now(),
+    duration: 0,
+    error: 'Run already in progress',
+    loggedIn: false,
+    totalRows: 0,
+    matchedCount: 0,
+    uncategorizedSent: 0,
+    skippedCount: 0,
+    backendStatus: 'running',
+  }
+}
+
 // ── Tab handling ──────────────────────────────────────────────────────────────
 
 function getQboTarget(settings: Settings) {
   return QBO_TARGETS[settings.qboEnvironment] ?? QBO_TARGETS.sandbox
 }
 
+function isQboBankingUrl(url: string | undefined, settings: Settings) {
+  if (!url) return false
+  const target = getQboTarget(settings)
+  return url.startsWith(target.openUrl.split('?')[0])
+}
+
 async function openOrFocusQBO(focus: boolean, settings: Settings): Promise<chrome.tabs.Tab | null> {
   const target = getQboTarget(settings)
+  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true })
+  if (activeTab?.id != null && isQboBankingUrl(activeTab.url, settings)) {
+    return activeTab
+  }
+
   const tabs = await chrome.tabs.query({ url: target.tabMatchUrl })
   if (tabs[0]?.id != null) {
     if (focus) {
@@ -75,6 +140,33 @@ async function openOrFocusQBO(focus: boolean, settings: Settings): Promise<chrom
     return tabs[0]
   }
   return chrome.tabs.create({ url: target.openUrl, active: focus })
+}
+
+async function requestStopRun() {
+  if (!activeRun) {
+    await clearRunState()
+    setBadge('')
+    return false
+  }
+
+  activeRun.stopRequested = true
+  await markRunning(activeRun)
+
+  if (activeRun.tabId != null) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: activeRun.tabId },
+        func: () => {
+          ;(window as Window & typeof globalThis & { __qboCategorizerStop?: boolean }).__qboCategorizerStop = true
+        },
+      })
+    } catch {
+      // The tab may still be loading or may no longer allow injection. The background job
+      // still observes stopRequested between major phases.
+    }
+  }
+
+  return true
 }
 
 function waitForTabComplete(tabId: number, timeoutMs = 30000): Promise<boolean> {
@@ -108,7 +200,20 @@ function waitForTabComplete(tabId: number, timeoutMs = 30000): Promise<boolean> 
 // Returns PageResult.
 
 async function inPageWorker(): Promise<PageResult> {
-  const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+  const pageWindow = window as Window & typeof globalThis & { __qboCategorizerStop?: boolean }
+  pageWindow.__qboCategorizerStop = false
+  const assertNotStopped = () => {
+    if (pageWindow.__qboCategorizerStop) throw new Error('QBO_CATEGORIZER_STOPPED')
+  }
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+  const wait = async (ms: number) => {
+    const started = Date.now()
+    while (Date.now() - started < ms) {
+      assertNotStopped()
+      await sleep(Math.min(250, ms - (Date.now() - started)))
+    }
+    assertNotStopped()
+  }
   const text = (el: Element | null | undefined) => el?.textContent?.trim() ?? ''
 
   // ── Logging ──────────────────────────────────────────────────────────────────
@@ -610,15 +715,32 @@ async function inPageWorker(): Promise<PageResult> {
 
 async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
   const start = Date.now()
+  if (activeRun) return makeInProgressResult(trigger)
+
+  const run: ActiveRun = {
+    id: `${start}-${Math.random().toString(36).slice(2)}`,
+    startedAt: start,
+    trigger,
+    stopRequested: false,
+  }
+  activeRun = run
+  await markRunning(run)
+
+  try {
   const settings = await getSettings()
   const focus = trigger === 'manual'
   const target = getQboTarget(settings)
 
   const tab = await openOrFocusQBO(focus, settings)
   if (!tab?.id) return finalize({ start, trigger, error: `Could not open ${target.label} tab` })
+  run.tabId = tab.id
+  await markRunning(run)
+
+  if (run.stopRequested) return finalize({ start, trigger, error: 'Stopped', backendStatus: 'stopped' })
 
   await waitForTabComplete(tab.id)
   await new Promise((r) => setTimeout(r, 2500))  // SPA settle
+  if (run.stopRequested) return finalize({ start, trigger, error: 'Stopped', backendStatus: 'stopped' })
 
   const loadedTab = await chrome.tabs.get(tab.id)
   if (!loadedTab.url?.includes('/app/banking')) {
@@ -646,8 +768,14 @@ async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
     })
     pageResult = r?.result as PageResult | undefined
   } catch (e) {
-    return finalize({ start, trigger, error: `Script injection failed: ${(e as Error).message}` })
+    const message = (e as Error).message
+    if (run.stopRequested || message.includes('QBO_CATEGORIZER_STOPPED')) {
+      return finalize({ start, trigger, error: 'Stopped', backendStatus: 'stopped' })
+    }
+    return finalize({ start, trigger, error: `Script injection failed: ${message}` })
   }
+
+  if (run.stopRequested) return finalize({ start, trigger, error: 'Stopped', backendStatus: 'stopped' })
 
   if (!pageResult) {
     return finalize({ start, trigger, error: 'No result from page' })
@@ -677,6 +805,7 @@ async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
   let backendStatus = 'no uncategorized rows to send'
   let uncategorizedSent = 0
   if (pageResult.uncategorized.length > 0) {
+    if (run.stopRequested) return finalize({ start, trigger, error: 'Stopped', details: pageResult, backendStatus: 'stopped' })
     try {
       const res = await fetch(settings.backendUrl, {
         method: 'POST',
@@ -716,6 +845,12 @@ async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
     backendStatus,
     uncategorizedSent,
   })
+  } finally {
+    if (activeRun?.id === run.id) activeRun = null
+    await clearRunState()
+    setBadge('')
+    await chrome.action.setTitle({ title: 'QBO Categorizer' })
+  }
 }
 
 function finalize({
@@ -754,11 +889,13 @@ function finalize({
 // ── Wire up listeners ────────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(async () => {
+  await clearRunState()
   const settings = await getSettings()
   await rescheduleAlarm(settings)
 })
 
 chrome.runtime.onStartup.addListener(async () => {
+  await clearRunState()
   const settings = await getSettings()
   await rescheduleAlarm(settings)
 })
@@ -787,9 +924,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await rescheduleAlarm(msg.settings)
         sendResponse({ ok: true })
       } else if (msg?.type === 'GET_LAST_RUN') {
-        const { lastRun } = await chrome.storage.local.get('lastRun')
+        const { lastRun, runState } = await chrome.storage.local.get(['lastRun', 'runState'])
         const alarms = await chrome.alarms.get(ALARM_NAME)
-        sendResponse({ ok: true, lastRun, nextRun: alarms?.scheduledTime ?? null })
+        sendResponse({ ok: true, lastRun, runState: runState ?? IDLE_RUN_STATE, nextRun: alarms?.scheduledTime ?? null })
+      } else if (msg?.type === 'STOP_RUN') {
+        const stopped = await requestStopRun()
+        sendResponse({ ok: true, stopped })
       } else if (msg?.type === 'OPEN_QBO') {
         const settings = await getSettings()
         const tab = await openOrFocusQBO(true, settings)

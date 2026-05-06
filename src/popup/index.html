@@ -103,6 +103,12 @@
     }
 
     /* ── Run Now button ─────────────────────────────── */
+    .run-actions {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: stretch;
+    }
     .btn-run {
       width: 100%;
       background: var(--accent);
@@ -139,6 +145,22 @@
     }
     .btn-run.loading .spinner { display: inline-block; }
     .btn-run.loading .play-icon { display: none; }
+    .btn-stop {
+      min-width: 72px;
+      background: #FDECEC;
+      color: var(--error);
+      border: 1px solid #F5C8C8;
+      border-radius: 8px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      padding: 0 12px;
+      transition: all .15s;
+    }
+    .btn-stop:hover:not(:disabled) { background: #FBDDDD; border-color: #F0AFAF; }
+    .btn-stop:disabled { opacity: .6; cursor: progress; }
+    .btn-stop[hidden] { display: none; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
     /* ── Compact form controls ──────────────────────── */
@@ -380,11 +402,14 @@
   <main>
     <div id="banner" style="display:none"></div>
 
-    <button id="btn-run" class="btn-run" type="button">
-      <svg class="play-icon" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-      <div class="spinner"></div>
-      <span class="label">Run Now</span>
-    </button>
+    <div class="run-actions">
+      <button id="btn-run" class="btn-run" type="button">
+        <svg class="play-icon" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+        <div class="spinner"></div>
+        <span class="label">Run Now</span>
+      </button>
+      <button id="btn-stop" class="btn-stop" type="button" hidden>Stop</button>
+    </div>
 
     <div class="card">
       <h3>Last run <span id="last-run-when" class="meta" style="margin:0"></span></h3>

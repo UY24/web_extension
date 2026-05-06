@@ -1,7 +1,8 @@
-import type { JobResult, Settings } from '../types'
+import type { JobResult, RunState, Settings } from '../types'
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const btnRun = document.getElementById('btn-run') as HTMLButtonElement
+const btnStop = document.getElementById('btn-stop') as HTMLButtonElement
 const btnOpen = document.getElementById('btn-open') as HTMLButtonElement
 const statusPill = document.getElementById('status-pill') as HTMLDivElement
 const banner = document.getElementById('banner') as HTMLDivElement
@@ -14,6 +15,7 @@ const scheduleTime = document.getElementById('schedule-time') as HTMLInputElemen
 const backendUrl = document.getElementById('backend-url') as HTMLInputElement
 const qboEnvSandbox = document.getElementById('qbo-env-sandbox') as HTMLInputElement
 const qboEnvProduction = document.getElementById('qbo-env-production') as HTMLInputElement
+let refreshTimer: number | undefined
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -44,6 +46,11 @@ function formatRelativeTime(ts: number): string {
 
 function formatTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+function scheduleRefresh(isRunning: boolean) {
+  if (refreshTimer != null) window.clearTimeout(refreshTimer)
+  refreshTimer = isRunning ? window.setTimeout(refresh, 1500) : undefined
 }
 
 // ── render ────────────────────────────────────────────────────────────────────
@@ -144,6 +151,30 @@ function renderSettings(s: Settings) {
   btnOpen.textContent = s.qboEnvironment === 'production' ? 'Open Production QBO ↗' : 'Open Sandbox QBO ↗'
 }
 
+function renderRunState(runState: RunState | null | undefined) {
+  const isRunning = runState?.running === true
+  const isStopping = runState?.stopRequested === true
+
+  btnRun.disabled = isRunning
+  btnRun.classList.toggle('loading', isRunning)
+  ;(btnRun.querySelector('.label') as HTMLElement).textContent = isRunning ? 'Running...' : 'Run Now'
+
+  btnStop.hidden = !isRunning
+  btnStop.disabled = !isRunning || isStopping
+  btnStop.textContent = isStopping ? 'Stopping...' : 'Stop'
+
+  if (isRunning) {
+    setStatusPill(isStopping ? 'Stopping' : 'Running', 'warn')
+    showBanner(
+      isStopping
+        ? '<strong>Stop requested.</strong> Finishing the current safe checkpoint.'
+        : '<strong>Running...</strong> You can close this popup. The toolbar badge stays active until the job finishes.'
+    )
+  }
+
+  scheduleRefresh(isRunning)
+}
+
 // ── messaging ─────────────────────────────────────────────────────────────────
 
 function send<T = unknown>(msg: object): Promise<T> {
@@ -157,10 +188,15 @@ function send<T = unknown>(msg: object): Promise<T> {
 
 async function refresh() {
   try {
-    const { lastRun, nextRun } = await send<{ lastRun: JobResult | null; nextRun: number | null }>({
+    const { lastRun, nextRun, runState } = await send<{
+      lastRun: JobResult | null
+      nextRun: number | null
+      runState: RunState
+    }>({
       type: 'GET_LAST_RUN',
     })
     renderLastRun(lastRun, nextRun)
+    renderRunState(runState)
   } catch (e) {
     setStatusPill('Background not ready', 'warn')
   }
@@ -187,9 +223,11 @@ async function saveSettings() {
 btnRun.addEventListener('click', async () => {
   btnRun.classList.add('loading')
   btnRun.disabled = true
-  ;(btnRun.querySelector('.label') as HTMLElement).textContent = 'Running…'
+  btnStop.hidden = false
+  btnStop.disabled = false
+  ;(btnRun.querySelector('.label') as HTMLElement).textContent = 'Running...'
   setStatusPill('Running', 'warn')
-  hideBanner()
+  showBanner('<strong>Running...</strong> You can close this popup. The toolbar badge stays active until the job finishes.')
 
   try {
     await send({ type: 'RUN_NOW' })
@@ -199,6 +237,15 @@ btnRun.addEventListener('click', async () => {
     ;(btnRun.querySelector('.label') as HTMLElement).textContent = 'Run Now'
     await refresh()
   }
+})
+
+btnStop.addEventListener('click', async () => {
+  btnStop.disabled = true
+  btnStop.textContent = 'Stopping...'
+  setStatusPill('Stopping', 'warn')
+  showBanner('<strong>Stop requested.</strong> Finishing the current safe checkpoint.')
+  await send({ type: 'STOP_RUN' })
+  await refresh()
 })
 
 btnOpen.addEventListener('click', async () => {
