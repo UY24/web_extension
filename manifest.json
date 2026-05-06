@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "QBO Banking Auto-Matcher",
+  "name": "QBO Categorizer",
   "version": "1.0.0",
   "description": "Automatically matches AI-suggested QuickBooks bank transactions and forwards uncategorized ones to your backend.",
   "permissions": ["activeTab", "scripting", "tabs", "storage", "alarms", "notifications"],
   "host_permissions": [
     "https://sandbox.qbo.intuit.com/*",
+    "https://qbo.intuit.com/*",
     "http://localhost:3001/*",
     "http://127.0.0.1:3001/*"
   ],
@@ -16,7 +17,7 @@
   },
   "action": {
     "default_popup": "src/popup/index.html",
-    "default_title": "QBO Auto-Matcher",
+    "default_title": "QBO Categorizer",
     "default_icon": {
       "16": "icon16.png",
       "48": "icon48.png",

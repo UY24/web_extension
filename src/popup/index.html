@@ -2,27 +2,27 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>QBO Auto-Matcher</title>
+  <title>QBO Categorizer</title>
   <style>
     :root {
       --primary: #1B365D;       /* Primary Navy */
-      --primary-dark: #142849;  /* Darker navy for gradients/hover */
+      --primary-dark: #142849;
       --accent: #00A3E0;        /* Accent Blue */
       --accent-dark: #0089bd;
-      --text: #4A4A4A;          /* Body Text — dark charcoal */
-      --bg: #FFFFFF;            /* App background */
-      --section-bg: #F4F7F9;    /* Section background */
+      --text: #4A4A4A;          /* Body Text */
+      --bg: #FFFFFF;            /* Background */
+      --section-bg: #F4F7F9;    /* Section BG */
       --card: #FFFFFF;
-      --border: #E1E7ED;
+      --border: #D9E2EA;
       --muted: #6B7C8E;
-      --success: #1B365D;       /* Use navy for success states */
+      --success: #1B365D;
       --warn: #D97706;
       --error: #DC2626;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { background: var(--section-bg); }
     body {
-      width: 380px;
+      width: 392px;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       font-size: 13px;
       color: var(--text);
@@ -31,31 +31,39 @@
 
     /* ── Header ─────────────────────────────────────── */
     header {
-      background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+      background: var(--primary);
       color: white;
-      padding: 16px 18px 14px;
+      padding: 18px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      box-shadow: 0 1px 3px rgba(27, 54, 93, 0.12);
+      box-shadow: 0 8px 20px rgba(27, 54, 93, 0.16);
     }
     header .title {
-      font-size: 14px;
+      font-size: 15px;
       font-weight: 600;
       display: flex;
       align-items: center;
       gap: 8px;
+      min-width: 0;
     }
     header .title svg { opacity: .9; }
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      flex-shrink: 0;
+    }
     .status-dot {
       display: inline-flex;
       align-items: center;
       gap: 6px;
       font-size: 11px;
       font-weight: 500;
-      background: rgba(255,255,255,.18);
+      background: rgba(255,255,255,.16);
       padding: 4px 9px;
       border-radius: 999px;
+      white-space: nowrap;
     }
     .status-dot::before {
       content: '';
@@ -74,8 +82,8 @@
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 13px 14px;
-      box-shadow: 0 1px 2px rgba(27, 54, 93, 0.04);
+      padding: 14px;
+      box-shadow: 0 1px 3px rgba(27, 54, 93, 0.06);
     }
     .card h3 {
       font-size: 11px;
@@ -83,7 +91,7 @@
       letter-spacing: .05em;
       color: var(--primary);
       font-weight: 700;
-      margin-bottom: 10px;
+      margin-bottom: 11px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -95,6 +103,7 @@
       background: var(--accent);
       color: white;
       border: none;
+      min-height: 44px;
       padding: 12px;
       font-size: 14px;
       font-weight: 600;
@@ -127,7 +136,7 @@
     .btn-run.loading .play-icon { display: none; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* ── Schedule ───────────────────────────────────── */
+    /* ── Compact form controls ──────────────────────── */
     .row {
       display: flex;
       align-items: center;
@@ -188,6 +197,57 @@
     }
     input[type="time"] { width: 100px; }
     input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+    .field-label {
+      display: block;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: var(--muted);
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .helper {
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .mini-env-toggle {
+      display: grid;
+      grid-template-columns: repeat(2, 28px);
+      gap: 2px;
+      background: rgba(255, 255, 255, .14);
+      border: 1px solid rgba(255, 255, 255, .22);
+      padding: 2px;
+      border-radius: 999px;
+    }
+    .mini-env-option {
+      position: relative;
+      display: block;
+    }
+    .mini-env-option input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .mini-env-option span {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 22px;
+      border-radius: 999px;
+      color: rgba(255, 255, 255, .72);
+      font-size: 10px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all .15s;
+    }
+    .mini-env-option input:checked + span {
+      background: white;
+      color: var(--primary);
+      box-shadow: 0 1px 4px rgba(0, 0, 0, .16);
+    }
+    .hidden-control { display: none !important; }
 
     /* ── Last run ───────────────────────────────────── */
     .stats {
@@ -276,30 +336,51 @@
       color: var(--muted);
     }
     .link-btn {
-      background: none;
-      border: none;
-      color: var(--accent);
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--primary);
       cursor: pointer;
-      font-size: 12px;
-      padding: 4px 8px;
+      font-size: 13px;
+      padding: 10px 12px;
       font-family: inherit;
-      font-weight: 500;
-      border-radius: 4px;
+      font-weight: 600;
+      border-radius: 8px;
       transition: all .15s;
     }
-    .link-btn:hover { color: var(--accent-dark); background: var(--section-bg); }
+    .link-btn:hover { color: var(--accent-dark); border-color: var(--accent); background: #F8FBFD; }
   </style>
 </head>
 <body>
   <header>
     <div class="title">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-        <rect x="3" y="3" width="18" height="18" rx="3" fill="white" fill-opacity=".18"/>
-        <path d="M9 12l2 2 4-4" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <svg width="20" height="20" viewBox="0 0 128 128" fill="none" aria-hidden="true">
+        <rect x="8" y="8" width="112" height="112" rx="28" fill="white" fill-opacity=".16"/>
+        <circle cx="64" cy="64" r="42" fill="#00A3E0" fill-opacity=".18"/>
+        <circle cx="28" cy="38" r="5" fill="#00A3E0"/>
+        <circle cx="28" cy="61" r="5" fill="#00A3E0"/>
+        <circle cx="28" cy="84" r="5" fill="#00A3E0"/>
+        <rect x="39" y="33" width="54" height="10" rx="5" fill="white" fill-opacity=".92"/>
+        <rect x="39" y="56" width="43" height="10" rx="5" fill="white" fill-opacity=".88"/>
+        <rect x="39" y="79" width="34" height="10" rx="5" fill="white" fill-opacity=".84"/>
+        <path d="M52 72L65 85L94 53" stroke="white" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M52 72L65 85L94 53" stroke="#00A3E0" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
-      QBO Auto-Matcher
+      QBO Categorizer
     </div>
-    <div id="status-pill" class="status-dot">Ready</div>
+    <div class="header-actions">
+      <div id="status-pill" class="status-dot">Ready</div>
+      <div class="mini-env-toggle" role="radiogroup" aria-label="QuickBooks environment">
+        <label class="mini-env-option" title="Sandbox">
+          <input id="qbo-env-sandbox" type="radio" name="qbo-environment" value="sandbox" checked />
+          <span>S</span>
+        </label>
+        <label class="mini-env-option" title="Production">
+          <input id="qbo-env-production" type="radio" name="qbo-environment" value="production" />
+          <span>P</span>
+        </label>
+      </div>
+    </div>
   </header>
 
   <main>
@@ -318,32 +399,18 @@
       </div>
     </div>
 
-    <div class="card">
-      <h3>Schedule</h3>
-      <div class="row">
-        <label>
-          Run automatically every day
-          <span id="next-run-text" class="label-sub">Off</span>
-        </label>
-        <label class="switch">
-          <input id="schedule-enabled" type="checkbox" />
-          <span class="slider"></span>
-        </label>
-      </div>
-      <div class="row">
-        <label>At
-          <span class="label-sub">Local time</span>
-        </label>
-        <input id="schedule-time" type="time" value="09:00" />
-      </div>
-    </div>
+    <span id="next-run-text" class="hidden-control">Off</span>
+    <input id="schedule-enabled" class="hidden-control" type="checkbox" />
+    <input id="schedule-time" class="hidden-control" type="time" value="09:00" />
 
     <div class="card">
-      <h3>Backend endpoint</h3>
+      <h3>Bookkeep endpoint</h3>
+      <label class="field-label" for="backend-url">LLM categorization API</label>
       <input id="backend-url" type="url" placeholder="http://localhost:3001/api/llm/qbo-categorize" />
+      <p class="helper">Uncategorized QBO rows are sent here for LLM categorization.</p>
     </div>
 
-    <div style="text-align:center">
+    <div>
       <button id="btn-open" class="link-btn" type="button">Open QBO Banking ↗</button>
     </div>
   </main>

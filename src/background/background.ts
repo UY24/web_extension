@@ -1,18 +1,29 @@
 import { DEFAULT_SETTINGS } from '../types'
 import type { JobResult, PageResult, Settings } from '../types'
 
-const QBO_URL = 'https://sandbox.qbo.intuit.com/app/banking'
+const QBO_TARGETS: Record<Settings['qboEnvironment'], { openUrl: string; tabMatchUrl: string; label: string }> = {
+  sandbox: {
+    openUrl: 'https://sandbox.qbo.intuit.com/app/banking',
+    tabMatchUrl: 'https://sandbox.qbo.intuit.com/app/banking*',
+    label: 'QuickBooks sandbox',
+  },
+  production: {
+    openUrl: 'https://qbo.intuit.com/app/banking?jobId=accounting',
+    tabMatchUrl: 'https://qbo.intuit.com/app/banking*',
+    label: 'QuickBooks production',
+  },
+}
 const ALARM_NAME = 'qbo-daily-run'
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 async function getSettings(): Promise<Settings> {
   const { settings } = await chrome.storage.local.get('settings')
-  return { ...DEFAULT_SETTINGS, ...(settings ?? {}) }
+  return { ...DEFAULT_SETTINGS, ...(settings ?? {}), scheduleEnabled: false }
 }
 
 async function setSettings(s: Settings) {
-  await chrome.storage.local.set({ settings: s })
+  await chrome.storage.local.set({ settings: { ...s, scheduleEnabled: false } })
 }
 
 async function rescheduleAlarm(s: Settings) {
@@ -49,8 +60,13 @@ function setBadge(text: string, color = '#2ca01c') {
 
 // ── Tab handling ──────────────────────────────────────────────────────────────
 
-async function openOrFocusQBO(focus: boolean): Promise<chrome.tabs.Tab | null> {
-  const tabs = await chrome.tabs.query({ url: `${QBO_URL}*` })
+function getQboTarget(settings: Settings) {
+  return QBO_TARGETS[settings.qboEnvironment] ?? QBO_TARGETS.sandbox
+}
+
+async function openOrFocusQBO(focus: boolean, settings: Settings): Promise<chrome.tabs.Tab | null> {
+  const target = getQboTarget(settings)
+  const tabs = await chrome.tabs.query({ url: target.tabMatchUrl })
   if (tabs[0]?.id != null) {
     if (focus) {
       await chrome.tabs.update(tabs[0].id, { active: true })
@@ -58,7 +74,7 @@ async function openOrFocusQBO(focus: boolean): Promise<chrome.tabs.Tab | null> {
     }
     return tabs[0]
   }
-  return chrome.tabs.create({ url: QBO_URL, active: focus })
+  return chrome.tabs.create({ url: target.openUrl, active: focus })
 }
 
 function waitForTabComplete(tabId: number, timeoutMs = 30000): Promise<boolean> {
@@ -87,7 +103,7 @@ function waitForTabComplete(tabId: number, timeoutMs = 30000): Promise<boolean> 
   })
 }
 
-// ── In-page extractor + auto-matcher (self-contained) ────────────────────────
+// ── In-page extractor + categorizer (self-contained) ─────────────────────────
 // Runs inside the QBO tab via chrome.scripting.executeScript.
 // Returns PageResult.
 
@@ -100,7 +116,7 @@ async function inPageWorker(): Promise<PageResult> {
   const log = (msg: string) => {
     const line = `[${new Date().toISOString().slice(11, 23)}] ${msg}`
     logs.push(line)
-    console.log('[QBO Auto-Matcher]', line)
+    console.log('[QBO Categorizer]', line)
   }
 
   log(`worker v1.8 started · url=${location.href}`)
@@ -145,7 +161,7 @@ async function inPageWorker(): Promise<PageResult> {
   function getPendingCount(): number | null {
     // The "Pending (25)" segment label
     const buttons = document.querySelectorAll<HTMLElement>('[data-testid^="segmentedBTN"]')
-    for (const b of buttons) {
+    for (const b of Array.from(buttons)) {
       const t = b.textContent?.trim() ?? ''
       const m = t.match(/Pending\s*\((\d+)\)/i)
       if (m) return parseInt(m[1])
@@ -186,7 +202,7 @@ async function inPageWorker(): Promise<PageResult> {
 
     // New ComboLink UI — primary link button whose text is "Match"
     const linkBtns = cell.querySelectorAll<HTMLButtonElement>('.idsLinkActionButton')
-    for (const b of linkBtns) {
+    for (const b of Array.from(linkBtns)) {
       if (/^Match$/i.test((b.textContent || '').trim())) return b
     }
 
@@ -217,7 +233,7 @@ async function inPageWorker(): Promise<PageResult> {
     }
     if (!btn) {
       const buttons = cell.querySelectorAll('button')
-      const summary = [...buttons].map((b) => `class="${b.className}" text="${(b.textContent || '').trim()}"`).join(' | ') || '(none)'
+      const summary = Array.from(buttons).map((b) => `class="${b.className}" text="${(b.textContent || '').trim()}"`).join(' | ') || '(none)'
       return {
         ok: false,
         method: 'no-match-btn',
@@ -320,7 +336,7 @@ async function inPageWorker(): Promise<PageResult> {
     // New ComboLink UI: read text of primary link button
     if (!action && actionCell) {
       const linkBtns = actionCell.querySelectorAll<HTMLButtonElement>('.idsLinkActionButton')
-      for (const b of linkBtns) {
+      for (const b of Array.from(linkBtns)) {
         const t = (b.textContent || '').trim()
         if (/^Match$/i.test(t)) { action = 'Match'; break }
         if (/^Post$/i.test(t))  { action = 'Post';  break }
@@ -357,7 +373,7 @@ async function inPageWorker(): Promise<PageResult> {
 
   function findRowByKey(target: RawRow): HTMLElement | null {
     const rows = document.querySelectorAll<HTMLElement>('#table-body-main tbody .idsTable__row')
-    for (const row of rows) {
+    for (const row of Array.from(rows)) {
       const date = text(row.querySelector('.txnDate'))
       const desc = text(row.querySelector('.description-tooltip'))
       const spent = text(row.querySelector('.spent .pull-right')).replace(/\s+/g, '')
@@ -596,12 +612,31 @@ async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
   const start = Date.now()
   const settings = await getSettings()
   const focus = trigger === 'manual'
+  const target = getQboTarget(settings)
 
-  const tab = await openOrFocusQBO(focus)
-  if (!tab?.id) return finalize({ start, trigger, error: 'Could not open QBO tab' })
+  const tab = await openOrFocusQBO(focus, settings)
+  if (!tab?.id) return finalize({ start, trigger, error: `Could not open ${target.label} tab` })
 
   await waitForTabComplete(tab.id)
   await new Promise((r) => setTimeout(r, 2500))  // SPA settle
+
+  const loadedTab = await chrome.tabs.get(tab.id)
+  if (!loadedTab.url?.includes('/app/banking')) {
+    return finalize({
+      start,
+      trigger,
+      error: 'Not logged in',
+      details: {
+        loggedIn: false,
+        url: loadedTab.url ?? '',
+        totalRows: 0,
+        autoMatched: [],
+        uncategorized: [],
+        skipped: [],
+        logs: [`Opened ${target.label}, but QuickBooks redirected away from /app/banking. Log in and run again.`],
+      },
+    })
+  }
 
   let pageResult: PageResult | undefined
   try {
@@ -627,7 +662,7 @@ async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
     setBadge('!', '#e55353')
     notify(
       'QBO not logged in',
-      'Please log into QuickBooks Online to run the auto-matcher.',
+      'Please log into QuickBooks Online to run the categorizer.',
       true
     )
     return finalize({
@@ -648,6 +683,7 @@ async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           source: 'qbo-extractor',
+          qboEnvironment: settings.qboEnvironment,
           trigger,
           count: pageResult.uncategorized.length,
           transactions: pageResult.uncategorized,
@@ -729,7 +765,12 @@ chrome.runtime.onStartup.addListener(async () => {
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARM_NAME) {
-    await runJob('scheduled')
+    const settings = await getSettings()
+    if (settings.scheduleEnabled) {
+      await runJob('scheduled')
+    } else {
+      await chrome.alarms.clear(ALARM_NAME)
+    }
   }
 })
 
@@ -750,7 +791,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const alarms = await chrome.alarms.get(ALARM_NAME)
         sendResponse({ ok: true, lastRun, nextRun: alarms?.scheduledTime ?? null })
       } else if (msg?.type === 'OPEN_QBO') {
-        const tab = await openOrFocusQBO(true)
+        const settings = await getSettings()
+        const tab = await openOrFocusQBO(true, settings)
         sendResponse({ ok: true, tabId: tab?.id })
       } else {
         sendResponse({ ok: false, error: 'unknown message' })

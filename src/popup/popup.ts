@@ -12,6 +12,8 @@ const nextRunText = document.getElementById('next-run-text') as HTMLSpanElement
 const scheduleEnabled = document.getElementById('schedule-enabled') as HTMLInputElement
 const scheduleTime = document.getElementById('schedule-time') as HTMLInputElement
 const backendUrl = document.getElementById('backend-url') as HTMLInputElement
+const qboEnvSandbox = document.getElementById('qbo-env-sandbox') as HTMLInputElement
+const qboEnvProduction = document.getElementById('qbo-env-production') as HTMLInputElement
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -137,6 +139,9 @@ function renderSettings(s: Settings) {
   scheduleEnabled.checked = s.scheduleEnabled
   scheduleTime.value = s.scheduleTime
   backendUrl.value = s.backendUrl
+  qboEnvSandbox.checked = s.qboEnvironment !== 'production'
+  qboEnvProduction.checked = s.qboEnvironment === 'production'
+  btnOpen.textContent = s.qboEnvironment === 'production' ? 'Open Production QBO ↗' : 'Open Sandbox QBO ↗'
 }
 
 // ── messaging ─────────────────────────────────────────────────────────────────
@@ -171,6 +176,7 @@ async function saveSettings() {
     scheduleEnabled: scheduleEnabled.checked,
     scheduleTime: scheduleTime.value || '09:00',
     backendUrl: backendUrl.value.trim() || 'http://localhost:3001/api/llm/qbo-categorize',
+    qboEnvironment: qboEnvProduction.checked ? 'production' : 'sandbox',
   }
   await send({ type: 'SET_SETTINGS', settings })
   await refresh()
@@ -203,6 +209,8 @@ btnOpen.addEventListener('click', async () => {
 scheduleEnabled.addEventListener('change', saveSettings)
 scheduleTime.addEventListener('change', saveSettings)
 backendUrl.addEventListener('change', saveSettings)
+qboEnvSandbox.addEventListener('change', saveSettings)
+qboEnvProduction.addEventListener('change', saveSettings)
 
 // ── init ─────────────────────────────────────────────────────────────────────
 

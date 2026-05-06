@@ -55,14 +55,18 @@ export interface JobResult {
   details?: PageResult
 }
 
+export type QBOEnvironment = 'sandbox' | 'production'
+
 export interface Settings {
   backendUrl: string
+  qboEnvironment: QBOEnvironment
   scheduleEnabled: boolean
   scheduleTime: string  // "HH:MM"
 }
 
 export const DEFAULT_SETTINGS: Settings = {
   backendUrl: 'http://localhost:3001/api/llm/qbo-categorize',
+  qboEnvironment: 'sandbox',
   scheduleEnabled: false,
   scheduleTime: '09:00',
 }
