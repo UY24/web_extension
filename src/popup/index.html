@@ -47,7 +47,12 @@
       gap: 8px;
       min-width: 0;
     }
-    header .title svg { opacity: .9; }
+    header .title img {
+      width: 22px;
+      height: 22px;
+      display: block;
+      flex-shrink: 0;
+    }
     .header-actions {
       display: flex;
       align-items: center;
@@ -354,18 +359,7 @@
 <body>
   <header>
     <div class="title">
-      <svg width="20" height="20" viewBox="0 0 128 128" fill="none" aria-hidden="true">
-        <rect x="8" y="8" width="112" height="112" rx="28" fill="white" fill-opacity=".16"/>
-        <circle cx="64" cy="64" r="42" fill="#00A3E0" fill-opacity=".18"/>
-        <circle cx="28" cy="38" r="5" fill="#00A3E0"/>
-        <circle cx="28" cy="61" r="5" fill="#00A3E0"/>
-        <circle cx="28" cy="84" r="5" fill="#00A3E0"/>
-        <rect x="39" y="33" width="54" height="10" rx="5" fill="white" fill-opacity=".92"/>
-        <rect x="39" y="56" width="43" height="10" rx="5" fill="white" fill-opacity=".88"/>
-        <rect x="39" y="79" width="34" height="10" rx="5" fill="white" fill-opacity=".84"/>
-        <path d="M52 72L65 85L94 53" stroke="white" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
-        <path d="M52 72L65 85L94 53" stroke="#00A3E0" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
+      <img src="/logo.svg" alt="QBO Categorizer Logo" />
       QBO Categorizer
     </div>
     <div class="header-actions">
