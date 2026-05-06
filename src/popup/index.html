@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>QBO Auto-Matcher</title>
+  <style>
+    :root {
+      --primary: #1B365D;       /* Primary Navy */
+      --primary-dark: #142849;  /* Darker navy for gradients/hover */
+      --accent: #00A3E0;        /* Accent Blue */
+      --accent-dark: #0089bd;
+      --text: #4A4A4A;          /* Body Text — dark charcoal */
+      --bg: #FFFFFF;            /* App background */
+      --section-bg: #F4F7F9;    /* Section background */
+      --card: #FFFFFF;
+      --border: #E1E7ED;
+      --muted: #6B7C8E;
+      --success: #1B365D;       /* Use navy for success states */
+      --warn: #D97706;
+      --error: #DC2626;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { background: var(--section-bg); }
+    body {
+      width: 380px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 13px;
+      color: var(--text);
+      line-height: 1.4;
+    }
+
+    /* ── Header ─────────────────────────────────────── */
+    header {
+      background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+      color: white;
+      padding: 16px 18px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 1px 3px rgba(27, 54, 93, 0.12);
+    }
+    header .title {
+      font-size: 14px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    header .title svg { opacity: .9; }
+    .status-dot {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 500;
+      background: rgba(255,255,255,.18);
+      padding: 4px 9px;
+      border-radius: 999px;
+    }
+    .status-dot::before {
+      content: '';
+      width: 7px; height: 7px;
+      background: #fff;
+      border-radius: 50%;
+      box-shadow: 0 0 6px rgba(255,255,255,.5);
+    }
+    .status-dot.ok::before     { background: #6FE3C5; }
+    .status-dot.warn::before   { background: #FFD96D; }
+    .status-dot.err::before    { background: #FF8585; }
+
+    /* ── Sections ───────────────────────────────────── */
+    main { padding: 14px; display: flex; flex-direction: column; gap: 12px; background: var(--section-bg); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 13px 14px;
+      box-shadow: 0 1px 2px rgba(27, 54, 93, 0.04);
+    }
+    .card h3 {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: var(--primary);
+      font-weight: 700;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    /* ── Run Now button ─────────────────────────────── */
+    .btn-run {
+      width: 100%;
+      background: var(--accent);
+      color: white;
+      border: none;
+      padding: 12px;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: .01em;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: all .15s;
+      box-shadow: 0 3px 8px rgba(0, 163, 224, 0.25);
+    }
+    .btn-run:hover:not(:disabled) {
+      background: var(--accent-dark);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(0, 163, 224, 0.35);
+    }
+    .btn-run:active:not(:disabled) { transform: translateY(0); }
+    .btn-run:disabled { opacity: .55; cursor: progress; }
+    .btn-run .spinner {
+      width: 14px; height: 14px;
+      border: 2px solid rgba(255,255,255,.4);
+      border-top-color: white;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      display: none;
+    }
+    .btn-run.loading .spinner { display: inline-block; }
+    .btn-run.loading .play-icon { display: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Schedule ───────────────────────────────────── */
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .row:last-child { margin-bottom: 0; }
+    .row label {
+      flex: 1;
+      font-size: 13px;
+      color: var(--text);
+    }
+    .row .label-sub {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 1px;
+    }
+
+    /* Switch */
+    .switch {
+      position: relative;
+      width: 36px; height: 20px;
+      flex-shrink: 0;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background: #ccd1d6;
+      border-radius: 999px;
+      transition: .2s;
+    }
+    .switch .slider::before {
+      content: '';
+      position: absolute;
+      width: 14px; height: 14px;
+      left: 3px; top: 3px;
+      background: white;
+      border-radius: 50%;
+      transition: .2s;
+      box-shadow: 0 1px 3px rgba(0,0,0,.2);
+    }
+    .switch input:checked + .slider { background: var(--accent); }
+    .switch input:checked + .slider::before { transform: translateX(16px); }
+
+    /* Inputs */
+    input[type="time"], input[type="text"], input[type="url"] {
+      padding: 7px 9px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 12px;
+      background: white;
+      width: 100%;
+      font-family: inherit;
+      color: var(--text);
+    }
+    input[type="time"] { width: 100px; }
+    input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+
+    /* ── Last run ───────────────────────────────────── */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+    }
+    .stat {
+      background: var(--section-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 9px 6px;
+      text-align: center;
+    }
+    .stat .num {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--primary);
+      letter-spacing: -0.02em;
+    }
+    .stat .num.ok    { color: var(--accent); }
+    .stat .num.warn  { color: var(--warn); }
+    .stat .num.muted { color: var(--muted); }
+    .stat .lbl {
+      display: block;
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .02em;
+      margin-top: 2px;
+    }
+    .meta {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 8px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    .badge.ok    { background: #E0F4FA; color: var(--accent-dark); }
+    .badge.err   { background: #FDE8E8; color: var(--error); }
+    .badge.warn  { background: #FFF4D6; color: var(--warn); }
+    .badge.muted { background: var(--section-bg); color: var(--muted); }
+
+    /* ── Empty / banner ─────────────────────────────── */
+    .banner {
+      background: #FFF8DB;
+      color: #7A5B00;
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      border: 1px solid #F5E6A8;
+    }
+    .banner.err {
+      background: #FDECEC;
+      color: #8A1F1F;
+      border-color: #F5C8C8;
+    }
+    .banner svg { flex-shrink: 0; margin-top: 1px; }
+
+    details { margin-top: 10px; }
+    details summary {
+      font-size: 11px;
+      color: var(--accent);
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+      font-weight: 600;
+    }
+    details summary:hover { color: var(--accent-dark); }
+    details summary::-webkit-details-marker { display: none; }
+    details summary::before { content: '▸ '; }
+    details[open] summary::before { content: '▾ '; }
+    details > div {
+      margin-top: 6px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .link-btn {
+      background: none;
+      border: none;
+      color: var(--accent);
+      cursor: pointer;
+      font-size: 12px;
+      padding: 4px 8px;
+      font-family: inherit;
+      font-weight: 500;
+      border-radius: 4px;
+      transition: all .15s;
+    }
+    .link-btn:hover { color: var(--accent-dark); background: var(--section-bg); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+        <rect x="3" y="3" width="18" height="18" rx="3" fill="white" fill-opacity=".18"/>
+        <path d="M9 12l2 2 4-4" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      QBO Auto-Matcher
+    </div>
+    <div id="status-pill" class="status-dot">Ready</div>
+  </header>
+
+  <main>
+    <div id="banner" style="display:none"></div>
+
+    <button id="btn-run" class="btn-run" type="button">
+      <svg class="play-icon" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+      <div class="spinner"></div>
+      <span class="label">Run Now</span>
+    </button>
+
+    <div class="card">
+      <h3>Last run <span id="last-run-when" class="meta" style="margin:0"></span></h3>
+      <div id="last-run">
+        <div class="meta" style="margin: 0; padding: 6px 0; color: var(--muted)">No runs yet.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Schedule</h3>
+      <div class="row">
+        <label>
+          Run automatically every day
+          <span id="next-run-text" class="label-sub">Off</span>
+        </label>
+        <label class="switch">
+          <input id="schedule-enabled" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="row">
+        <label>At
+          <span class="label-sub">Local time</span>
+        </label>
+        <input id="schedule-time" type="time" value="09:00" />
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Backend endpoint</h3>
+      <input id="backend-url" type="url" placeholder="http://localhost:3001/api/llm/qbo-categorize" />
+    </div>
+
+    <div style="text-align:center">
+      <button id="btn-open" class="link-btn" type="button">Open QBO Banking ↗</button>
+    </div>
+  </main>
+
+  <script type="module" src="popup.ts"></script>
+</body>
+</html>

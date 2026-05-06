@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "QBO Banking Auto-Matcher",
+  "version": "1.0.0",
+  "description": "Automatically matches AI-suggested QuickBooks bank transactions and forwards uncategorized ones to your backend.",
+  "permissions": ["activeTab", "scripting", "tabs", "storage", "alarms", "notifications"],
+  "host_permissions": [
+    "https://sandbox.qbo.intuit.com/*",
+    "http://localhost:3001/*",
+    "http://127.0.0.1:3001/*"
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "action": {
+    "default_popup": "src/popup/index.html",
+    "default_title": "QBO Auto-Matcher",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "src/background/background.ts",
+    "type": "module"
+  }
+}
