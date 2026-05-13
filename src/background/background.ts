@@ -776,12 +776,15 @@ async function applyCategoriesInPage(
     received: string
   }[]
 ): Promise<{
-  rowIndex: string
-  status: 'applied' | 'failed'
-  suggestedCategory: string
-  categoryId: string | null
-  error: string | null
-}[]> {
+  events: {
+    rowIndex: string
+    status: 'applied' | 'failed'
+    suggestedCategory: string
+    categoryId: string | null
+    error: string | null
+  }[]
+  logs: string[]
+}> {
   const pageWindow = window as Window & typeof globalThis & { __qboCategorizerStop?: boolean }
   const assertNotStopped = () => {
     if (pageWindow.__qboCategorizerStop) throw new Error('QBO_CATEGORIZER_STOPPED')
@@ -795,7 +798,14 @@ async function applyCategoriesInPage(
     }
     assertNotStopped()
   }
-  const text = (el: Element | null | undefined) => el?.textContent?.trim() ?? ''
+
+  const logs: string[] = []
+  const log = (msg: string) => {
+    const line = `[${new Date().toISOString().slice(11, 23)}] [apply] ${msg}`
+    logs.push(line)
+    console.log('[QBO Categorizer]', line)
+  }
+  log(`apply worker v1.0 started · suggestions=${suggestions.length}`)
 
   function findRowByRowIndex(rowIndex: string): HTMLElement | null {
     const rows = document.querySelectorAll<HTMLElement>('#table-body-main tbody .idsTable__row')
@@ -952,57 +962,133 @@ async function applyCategoriesInPage(
     return ''
   }
 
-  async function openDropdown(row: HTMLElement): Promise<HTMLElement | null> {
+  // Type a query into the typeahead input so QBO filters the listbox to it.
+  // The unfiltered list shows only a short "popular" set — most targets aren't
+  // in it, which is why the dropdown sometimes appeared untouched.
+  async function typeIntoInput(input: HTMLInputElement, value: string) {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+    // Clear first — React-controlled inputs only fire onChange when the native
+    // value setter is invoked AND an input event is dispatched.
+    if (setter) setter.call(input, '')
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    await wait(40)
+    if (setter) setter.call(input, value)
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  }
+
+  async function openDropdown(
+    row: HTMLElement,
+    query: string,
+  ): Promise<HTMLElement | null> {
     // Step 1: if phantom button is present, click to hydrate into the typeahead.
     const phantom = phantomCategoryButton(row)
     if (phantom) {
+      log(`    [dropdown] phantom button present → clicking to hydrate`)
       phantom.click()
       await wait(700)
+    } else {
+      log(`    [dropdown] no phantom button (already hydrated or different state)`)
     }
 
     // Step 2: find the typeahead input.
     let input: HTMLInputElement | null =
       row.querySelector('input[aria-label="Select category"]') as HTMLInputElement | null
+    let inputPolls = 0
     for (let i = 0; i < 10 && !input; i++) {
+      inputPolls++
       await wait(120)
       input =
         (row.querySelector('input[aria-label="Select category"]') as HTMLInputElement | null) ??
         (document.querySelector('input[aria-label="Select category"]') as HTMLInputElement | null)
     }
-    if (!input) return null
+    if (!input) {
+      log(`    [dropdown] FAIL: typeahead input never appeared after ${inputPolls} polls`)
+      return null
+    }
+    log(`    [dropdown] typeahead input found after ${inputPolls} polls`)
 
     // Step 3: click + focus opens the listbox (input event alone does nothing).
     input.focus()
     input.click()
 
     // Step 4: wait for the listbox to render.
+    let panel: HTMLElement | null = null
+    let panelPolls = 0
     for (let i = 0; i < 20; i++) {
-      const panel = document.querySelector<HTMLElement>('ul[role="listbox"]')
-      if (panel && panel.offsetParent !== null) return panel
+      panelPolls++
+      panel = document.querySelector<HTMLElement>('ul[role="listbox"]')
+      if (panel && panel.offsetParent !== null) break
       await wait(120)
     }
-    return null
+    if (!panel) {
+      log(`    [dropdown] FAIL: listbox never rendered after ${panelPolls} polls`)
+      return null
+    }
+    const preCount = panel.querySelectorAll('li[role="option"].quickfillMenuItem').length
+    log(`    [dropdown] listbox open · options(pre-filter)=${preCount}`)
+
+    // Step 5: type the query to filter the listbox to the target. QBO only
+    // shows a short "popular" set unfiltered; typing causes the full match to
+    // surface in the listbox. Use the first significant word (longer than 2
+    // chars) — QBO does substring matching, so a partial is enough and avoids
+    // mis-filtering on long names with parentheses or punctuation.
+    const firstWord = query.split(/[\s,()&/–-]+/).find((w) => w.length > 2) ?? query
+    log(`    [dropdown] typing "${firstWord}" (from suggested="${query}")`)
+    await typeIntoInput(input, firstWord)
+    // Wait for the listbox to re-render filtered results.
+    await wait(350)
+    // Re-resolve the panel — QBO may swap nodes during filter.
+    panel =
+      document.querySelector<HTMLElement>('ul[role="listbox"]') ?? panel
+    const postCount = panel.querySelectorAll('li[role="option"].quickfillMenuItem').length
+    log(`    [dropdown] post-filter options=${postCount}`)
+    return panel
   }
 
   async function selectCategoryOption(
     panel: HTMLElement,
     suggestion: { suggestedCategory: string; categoryId: string | null },
   ): Promise<boolean> {
-    const targetLower = suggestion.suggestedCategory.trim().toLowerCase()
     const normalize = (s: string) =>
       s.toLowerCase().replace(/\s+/g, ' ').trim()
     const targetNorm = normalize(suggestion.suggestedCategory)
-    const options = panel.querySelectorAll<HTMLElement>(
-      'li[role="option"].quickfillMenuItem',
-    )
+
+    // Re-resolve options on each pass — QBO can re-render the listbox between
+    // open and click (especially right after a filter).
+    const getOptions = () => {
+      const live =
+        document.querySelector<HTMLElement>('ul[role="listbox"]') ?? panel
+      return Array.from(
+        live.querySelectorAll<HTMLElement>('li[role="option"].quickfillMenuItem'),
+      )
+    }
+
+    const clickOpt = (opt: HTMLElement) => {
+      // Some QBO builds need a real mouse sequence to register the selection;
+      // a bare .click() can be swallowed by the typeahead.
+      const r = opt.getBoundingClientRect()
+      const o: MouseEventInit & PointerEventInit = {
+        bubbles: true, cancelable: true, view: window, button: 0, buttons: 1,
+        clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
+        composed: true, pointerType: 'mouse', pointerId: 1, isPrimary: true,
+      }
+      opt.dispatchEvent(new PointerEvent('pointerdown', o))
+      opt.dispatchEvent(new MouseEvent('mousedown', o))
+      opt.dispatchEvent(new PointerEvent('pointerup', o))
+      opt.dispatchEvent(new MouseEvent('mouseup', o))
+      opt.dispatchEvent(new MouseEvent('click', o))
+      try { opt.click() } catch {}
+    }
 
     // Pass 1: exact leaf-span match (most reliable).
-    for (const opt of Array.from(options)) {
+    for (const opt of getOptions()) {
       for (const span of Array.from(opt.querySelectorAll<HTMLElement>('span'))) {
         if (span.children.length > 0) continue
         const txt = normalize(span.textContent ?? '')
-        if (txt === targetNorm || txt.toLowerCase() === targetLower) {
-          opt.click()
+        if (txt === targetNorm) {
+          log(`    [select] pass1 exact-leaf-span match → clicking`)
+          clickOpt(opt)
           return true
         }
       }
@@ -1011,29 +1097,47 @@ async function applyCategoriesInPage(
     // Pass 2: case-insensitive leaf-span "starts with" — QBO sometimes wraps
     // names with type/parent suffixes inside a single span depending on locale
     // (e.g., "Office Expenses & Supplies (Expense)").
-    for (const opt of Array.from(options)) {
+    for (const opt of getOptions()) {
       for (const span of Array.from(opt.querySelectorAll<HTMLElement>('span'))) {
         if (span.children.length > 0) continue
         const txt = normalize(span.textContent ?? '')
         if (txt.startsWith(targetNorm)) {
-          opt.click()
+          log(`    [select] pass2 starts-with match on "${txt.slice(0, 40)}..." → clicking`)
+          clickOpt(opt)
           return true
         }
       }
     }
 
     // Pass 3: any element inside the LI whose direct text equals the target.
-    for (const opt of Array.from(options)) {
+    for (const opt of getOptions()) {
       for (const el of Array.from(opt.querySelectorAll<HTMLElement>('*'))) {
         if (el.children.length > 0) continue
         const txt = normalize(el.textContent ?? '')
         if (txt === targetNorm) {
-          opt.click()
+          log(`    [select] pass3 nested-element exact match → clicking`)
+          clickOpt(opt)
           return true
         }
       }
     }
 
+    // Pass 4: substring match on the option's full text. Only fires if exactly
+    // one option contains the target — guards against picking the wrong row when
+    // many categories share a word (e.g., "Office Supplies" vs "Office Rent").
+    const opts = getOptions()
+    const containing = opts.filter((opt) =>
+      normalize(opt.textContent ?? '').includes(targetNorm),
+    )
+    if (containing.length === 1) {
+      log(`    [select] pass4 unique-substring match on "${normalize(containing[0].textContent ?? '').slice(0, 40)}..." → clicking`)
+      clickOpt(containing[0])
+      return true
+    }
+
+    // Failure diagnostic: dump option labels so we can see what was actually visible.
+    const labels = opts.slice(0, 8).map((o) => normalize(o.textContent ?? '').slice(0, 40))
+    log(`    [select] FAIL: no match for "${targetNorm}". Visible options (${opts.length} total): ${JSON.stringify(labels)}`)
     return false
   }
 
@@ -1041,9 +1145,13 @@ async function applyCategoriesInPage(
     // QBO can take 3-4s to confirm a category change in the For Review row,
     // especially on larger COAs. Poll for up to 6s.
     for (let i = 0; i < 50; i++) {
-      if (!isUncategorized(row)) return true
+      if (!isUncategorized(row)) {
+        log(`    [verify] category persisted after ${i} polls (${i * 120}ms)`)
+        return true
+      }
       await wait(120)
     }
+    log(`    [verify] FAIL: row still shows Uncategorized after 6s`)
     return false
   }
 
@@ -1076,7 +1184,8 @@ async function applyCategoriesInPage(
 
   // QBO's "Post" action button lives in the same action cell as Match.
   // Two UI variants — old phantom (.action-phantom.post-action) and new
-  // ComboLink (.idsLinkActionButton with text "Post").
+  // ComboLink (.idsLinkActionButton with text "Post" — or "Add" / "Confirm"
+  // on some QBO builds).
   function findPostBtn(cell: HTMLElement): HTMLButtonElement | null {
     const phantom =
       cell.querySelector<HTMLButtonElement>('.post-action:not(.action-phantom)') ??
@@ -1085,47 +1194,76 @@ async function applyCategoriesInPage(
     if (phantom) return phantom
     const linkBtns = cell.querySelectorAll<HTMLButtonElement>('.idsLinkActionButton')
     for (const b of Array.from(linkBtns)) {
-      if (/^Post$/i.test((b.textContent || '').trim())) return b
+      if (/^(Post|Add|Confirm)$/i.test((b.textContent || '').trim())) return b
+    }
+    return null
+  }
+
+  // After a category save, the action cell re-renders. Poll until the Post
+  // button is in a clickable state (connected + non-phantom) so we don't
+  // click a button that QBO is about to detach. Returns the live button or
+  // null if it never stabilized.
+  async function waitForStablePostBtn(
+    cell: HTMLElement,
+    row: HTMLElement,
+  ): Promise<HTMLButtonElement | null> {
+    for (let i = 0; i < 40; i++) {
+      let btn = findPostBtn(cell)
+      if (!btn) {
+        // Wake phantom by hovering — same trick as Match.
+        fireHoverChain(row)
+        fireHoverChain(cell)
+      }
+      btn = findPostBtn(cell)
+      if (btn && btn.isConnected && !btn.classList.contains('action-phantom')) {
+        const label = (btn.textContent || '').trim()
+        log(`    [post-btn] stable after ${i * 120}ms · label="${label}" · class="${btn.className.slice(0, 50)}..."`)
+        return btn
+      }
+      await wait(120)
+    }
+    const fallback = findPostBtn(cell)
+    log(`    [post-btn] WARN: never stabilized after 5s · fallback=${fallback ? `label="${(fallback.textContent || '').trim()}" phantom=${fallback.classList.contains('action-phantom')}` : 'null'}`)
+    return fallback
+  }
+
+  function getPendingCount(): number | null {
+    const buttons = document.querySelectorAll<HTMLElement>('[data-testid^="segmentedBTN"]')
+    for (const b of Array.from(buttons)) {
+      const t = b.textContent?.trim() ?? ''
+      const m = t.match(/Pending\s*\((\d+)\)/i)
+      if (m) return parseInt(m[1])
     }
     return null
   }
 
   // Click the row's Post action. Returns true if the row disappears from the
-  // table (= QBO accepted the post), false otherwise.
+  // table OR the Pending count drops (= QBO accepted the post).
   async function clickPostAndVerify(row: HTMLElement): Promise<{ ok: boolean; error: string | null }> {
     const cell = row.querySelector<HTMLElement>('.idsTable__cell.action')
-    if (!cell) return { ok: false, error: 'no action cell' }
+    if (!cell) {
+      log(`    [post] FAIL: no action cell on row`)
+      return { ok: false, error: 'no action cell' }
+    }
 
-    let btn = findPostBtn(cell)
+    // Ensure any listbox from the category select is fully gone — its overlay
+    // can swallow the Post click otherwise.
+    await waitForListboxClosed()
+
+    // Wait for the action cell to settle after the category-save re-render.
+    const btn = await waitForStablePostBtn(cell, row)
     if (!btn) {
-      // Phantom buttons hydrate on row hover. Wake it up and re-find.
-      fireHoverChain(row)
-      fireHoverChain(cell)
-      for (let i = 0; i < 8; i++) {
-        await wait(120)
-        btn = findPostBtn(cell)
-        if (btn) break
-      }
+      log(`    [post] FAIL: post button not found`)
+      return { ok: false, error: 'post button not found' }
     }
-    if (!btn) return { ok: false, error: 'post button not found' }
+    if (!btn.isConnected) {
+      log(`    [post] FAIL: post button detached before click`)
+      return { ok: false, error: 'post button detached before click' }
+    }
 
-    const isPhantom = btn.classList.contains('action-phantom')
-    if (isPhantom) {
-      // Old phantom UI: hover hand-off swaps the DOM element. Re-find after.
-      fireHoverChain(row)
-      fireHoverChain(cell)
-      fireHoverChain(btn)
-      for (let i = 0; i < 8; i++) {
-        await wait(80)
-        const fresh = findPostBtn(cell)
-        if (fresh && fresh.isConnected && !fresh.classList.contains('action-phantom')) {
-          btn = fresh
-          break
-        }
-        if (fresh && fresh.isConnected) btn = fresh
-      }
-      if (!btn || !btn.isConnected) return { ok: false, error: 'phantom post button vanished' }
-    }
+    const label = (btn.textContent || '').trim()
+    const pendingBefore = getPendingCount()
+    log(`    [post] clicking "${label}" · pendingBefore=${pendingBefore ?? '?'}`)
 
     const o = mkPointerOpts(btn)
     btn.dispatchEvent(new PointerEvent('pointerdown', o))
@@ -1136,30 +1274,71 @@ async function applyCategoriesInPage(
     btn.dispatchEvent(new MouseEvent('click', o))
     try { btn.click() } catch {}
 
-    // QBO removes the row from the Pending list once Post succeeds.
-    // Poll for up to 4s for the row to detach.
-    for (let i = 0; i < 32; i++) {
+    // QBO removes the row OR drops the Pending count once Post succeeds.
+    // Poll for up to ~8s — slow COAs or laggy QBO can take 5-7s.
+    for (let i = 0; i < 64; i++) {
       await wait(125)
-      if (!row.isConnected) return { ok: true, error: null }
+      if (!row.isConnected) {
+        log(`    [post] CONFIRMED · row detached after ${i * 125}ms`)
+        return { ok: true, error: null }
+      }
+      if (pendingBefore != null) {
+        const now = getPendingCount()
+        if (now != null && now < pendingBefore) {
+          log(`    [post] CONFIRMED · pending ${pendingBefore}→${now} after ${i * 125}ms`)
+          return { ok: true, error: null }
+        }
+      }
     }
-    return { ok: false, error: 'post not confirmed (row still present)' }
+    const pendingAfter = getPendingCount()
+    log(`    [post] FAIL · pending ${pendingBefore ?? '?'}→${pendingAfter ?? '?'} · row ${row.isConnected ? 'still present' : 'detached'}`)
+    return {
+      ok: false,
+      error: `post not confirmed (button="${label}", pending ${pendingBefore ?? '?'}→${pendingAfter ?? '?'}, row ${row.isConnected ? 'still present' : 'detached'})`,
+    }
   }
 
-  // Click-outside to dismiss any open listbox so the next row's interaction starts clean.
-  // Waits up to 1.5s for [role="listbox"] to disappear from the document.
+  // Dismiss any open listbox so the next row's interaction starts clean. We
+  // send Escape (not document.body.click) because the body click can hit an
+  // unrelated UI element (and was observed swallowing the Post click that
+  // followed). Waits up to ~2s for [role="listbox"] to disappear.
   async function waitForListboxClosed(): Promise<void> {
-    // Best-effort: blur active element and click on a benign area.
-    try {
-      ;(document.activeElement as HTMLElement | null)?.blur?.()
-      document.body.click()
-    } catch {
-      // ignore
+    const sendEscape = () => {
+      const target =
+        (document.activeElement as HTMLElement | null) ??
+        document.querySelector<HTMLElement>('input[aria-label="Select category"]') ??
+        document.body
+      const opts: KeyboardEventInit = {
+        key: 'Escape',
+        code: 'Escape',
+        keyCode: 27,
+        which: 27,
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+      }
+      try {
+        target.dispatchEvent(new KeyboardEvent('keydown', opts))
+        target.dispatchEvent(new KeyboardEvent('keyup', opts))
+      } catch {
+        // ignore
+      }
+      try { (document.activeElement as HTMLElement | null)?.blur?.() } catch {}
     }
-    for (let i = 0; i < 15; i++) {
+    sendEscape()
+    for (let i = 0; i < 20; i++) {
       const panel = document.querySelector<HTMLElement>('ul[role="listbox"]')
-      if (!panel || panel.offsetParent === null) return
+      if (!panel || panel.offsetParent === null) {
+        if (i > 0) log(`    [listbox] closed after ${i * 100}ms`)
+        return
+      }
+      if (i === 8) {
+        log(`    [listbox] still open at 800ms — re-sending Escape`)
+        sendEscape()
+      }
       await wait(100)
     }
+    log(`    [listbox] WARN: still open after 2s — proceeding anyway`)
   }
 
   const events: {
@@ -1172,22 +1351,28 @@ async function applyCategoriesInPage(
 
   for (const s of suggestions) {
     assertNotStopped()
+    log(`→ APPLY row#${s.rowIndex} | ${s.date} "${s.description}" | spent=${s.spent || '-'} received=${s.received || '-'} | suggest="${s.suggestedCategory}" (catId=${s.categoryId ?? 'null'})`)
 
     // Re-resolve the row by aria-rowindex right before each operation. The previous
     // apply may have triggered a re-render, so a cached reference could be stale.
     let row = await ensureRowVisible(s.rowIndex, { date: s.date, description: s.description, spent: s.spent, received: s.received })
     if (!row) {
+      log(`  ✗ row not found even after scrolling`)
       events.push({ rowIndex: s.rowIndex, status: 'failed', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'row not found' })
       continue
     }
+    log(`  row visible`)
+
     if (!isUncategorized(row)) {
       // QBO may have already categorized this row (auto-suggested from a sibling
       // we just applied). Treat as success if the current category matches our
       // suggestion; otherwise log the actual disagreement.
       const current = readCurrentCategory(row)
       if (current && current.trim().toLowerCase() === s.suggestedCategory.trim().toLowerCase()) {
+        log(`  ✓ already categorized as "${current}" (matches suggestion — auto-applied by QBO)`)
         events.push({ rowIndex: s.rowIndex, status: 'applied', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'auto-applied by QBO' })
       } else {
+        log(`  ✗ row already categorized · current="${current}" ≠ suggest="${s.suggestedCategory}"`)
         events.push({
           rowIndex: s.rowIndex,
           status: 'failed',
@@ -1199,24 +1384,27 @@ async function applyCategoriesInPage(
       continue
     }
 
-    const panel = await openDropdown(row)
+    const panel = await openDropdown(row, s.suggestedCategory)
     if (!panel) {
+      log(`  ✗ dropdown did not open`)
       events.push({ rowIndex: s.rowIndex, status: 'failed', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'dropdown did not open' })
       continue
     }
 
     const picked = await selectCategoryOption(panel, s)
     if (!picked) {
-      // Close any leftover listbox before moving on.
+      log(`  ✗ option not selected · dismissing listbox`)
       await waitForListboxClosed()
       events.push({ rowIndex: s.rowIndex, status: 'failed', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'option not found' })
       continue
     }
+    log(`  option clicked · verifying save`)
 
     // Re-resolve the row again — option click can detach the original element.
     row = await ensureRowVisible(s.rowIndex, { date: s.date, description: s.description, spent: s.spent, received: s.received }) ?? row
     const ok = await verifySaved(row)
     if (!ok) {
+      log(`  ✗ save not confirmed`)
       events.push({ rowIndex: s.rowIndex, status: 'failed', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'save not confirmed' })
       await waitForListboxClosed()
       continue
@@ -1229,15 +1417,18 @@ async function applyCategoriesInPage(
     row = await ensureRowVisible(s.rowIndex, { date: s.date, description: s.description, spent: s.spent, received: s.received }) ?? row
     const post = await clickPostAndVerify(row)
     if (post.ok) {
+      log(`  ✓ APPLIED row#${s.rowIndex}`)
       events.push({ rowIndex: s.rowIndex, status: 'applied', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: null })
     } else {
       // Category is set in QBO but the row wasn't posted. Still a partial success
       // — surface the post failure so the audit log captures it.
+      log(`  ⚠ category set but post failed · ${post.error}`)
       events.push({ rowIndex: s.rowIndex, status: 'applied', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: `category set, post failed: ${post.error}` })
     }
   }
 
-  return events
+  log(`apply DONE · ${events.filter((e) => e.status === 'applied').length}/${events.length} applied`)
+  return { events, logs }
 }
 
 // ── Job runner ────────────────────────────────────────────────────────────────
@@ -1411,8 +1602,19 @@ async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
           func: applyCategoriesInPage,
           args: [accepted.map(enrich)],
         })
-        const firstPass = (r1?.result ?? []) as Omit<ApplyEvent, 'confidence' | 'source' | 'qboTransactionId'>[]
-        events = firstPass.map((e) => {
+        const firstResult = (r1?.result ?? { events: [], logs: [] }) as {
+          events: Omit<ApplyEvent, 'confidence' | 'source' | 'qboTransactionId'>[]
+          logs: string[]
+        }
+        // Mirror apply logs to the SW console and into pageResult.logs so they
+        // show up in lastRun.details.logs alongside the match phase.
+        console.group(`%c[QBO Apply · pass 1]`, 'color:#2ca01c;font-weight:bold')
+        firstResult.logs.forEach((line) => console.log(line))
+        console.groupEnd()
+        if (Array.isArray(pageResult.logs)) {
+          pageResult.logs.push('--- apply pass 1 ---', ...firstResult.logs)
+        }
+        events = firstResult.events.map((e) => {
           const s = accepted.find((x) => x.rowIndex === e.rowIndex)!
           return { ...e, confidence: s.confidence, source: s.source, qboTransactionId: null }
         })
@@ -1430,8 +1632,17 @@ async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
             func: applyCategoriesInPage,
             args: [retryEnriched],
           })
-          const retryPass = (r2?.result ?? []) as Omit<ApplyEvent, 'confidence' | 'source' | 'qboTransactionId'>[]
-          for (const retry of retryPass) {
+          const retryResult = (r2?.result ?? { events: [], logs: [] }) as {
+            events: Omit<ApplyEvent, 'confidence' | 'source' | 'qboTransactionId'>[]
+            logs: string[]
+          }
+          console.group(`%c[QBO Apply · pass 2 retry]`, 'color:#D97706;font-weight:bold')
+          retryResult.logs.forEach((line) => console.log(line))
+          console.groupEnd()
+          if (Array.isArray(pageResult.logs)) {
+            pageResult.logs.push('--- apply pass 2 retry ---', ...retryResult.logs)
+          }
+          for (const retry of retryResult.events) {
             const slot = events.findIndex((e) => e.rowIndex === retry.rowIndex)
             if (slot >= 0) {
               const s = accepted.find((x) => x.rowIndex === retry.rowIndex)!
