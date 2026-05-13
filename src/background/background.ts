@@ -1199,34 +1199,6 @@ async function applyCategoriesInPage(
     return null
   }
 
-  // After a category save, the action cell re-renders. Poll until the Post
-  // button is in a clickable state (connected + non-phantom) so we don't
-  // click a button that QBO is about to detach. Returns the live button or
-  // null if it never stabilized.
-  async function waitForStablePostBtn(
-    cell: HTMLElement,
-    row: HTMLElement,
-  ): Promise<HTMLButtonElement | null> {
-    for (let i = 0; i < 40; i++) {
-      let btn = findPostBtn(cell)
-      if (!btn) {
-        // Wake phantom by hovering — same trick as Match.
-        fireHoverChain(row)
-        fireHoverChain(cell)
-      }
-      btn = findPostBtn(cell)
-      if (btn && btn.isConnected && !btn.classList.contains('action-phantom')) {
-        const label = (btn.textContent || '').trim()
-        log(`    [post-btn] stable after ${i * 120}ms · label="${label}" · class="${btn.className.slice(0, 50)}..."`)
-        return btn
-      }
-      await wait(120)
-    }
-    const fallback = findPostBtn(cell)
-    log(`    [post-btn] WARN: never stabilized after 5s · fallback=${fallback ? `label="${(fallback.textContent || '').trim()}" phantom=${fallback.classList.contains('action-phantom')}` : 'null'}`)
-    return fallback
-  }
-
   function getPendingCount(): number | null {
     const buttons = document.querySelectorAll<HTMLElement>('[data-testid^="segmentedBTN"]')
     for (const b of Array.from(buttons)) {
@@ -1237,8 +1209,101 @@ async function applyCategoriesInPage(
     return null
   }
 
-  // Click the row's Post action. Returns true if the row disappears from the
-  // table OR the Pending count drops (= QBO accepted the post).
+  // Two UIs to handle:
+  //   - new ComboLink (.idsLinkActionButton with text "Post"): click directly,
+  //     NO hover (hovering triggers React re-render that detaches).
+  //   - old phantom (.action-phantom.post-action with <span>Post</span>):
+  //     Morpheus widget. The phantom is a click-INERT placeholder until
+  //     hydration replaces it with a real <button.post-action> (no
+  //     action-phantom class). This is the key difference from Match: phantom
+  //     Match buttons have their own click handler that fires the match
+  //     action, but phantom Post buttons do NOT — they're pure placeholders
+  //     and must be hydrated before clicking.
+  //
+  // Strategy for phantom: hover the cell aggressively (re-firing hover every
+  // 500ms so Morpheus sees a sustained mouse-in state) and poll up to ~5s for
+  // the phantom to be replaced by a hydrated button. If that fails, fall back
+  // to clicking the phantom directly — some QBO builds wire the phantom's
+  // onClick to trigger BOTH hydration and the action.
+  async function locateAndPrepPostBtn(
+    cell: HTMLElement,
+    row: HTMLElement,
+  ): Promise<{ btn: HTMLButtonElement | null; uiKind: string; polls: number; reason?: string }> {
+    let btn = findPostBtn(cell)
+    let polls = 0
+    if (!btn) {
+      fireHoverChain(row)
+      fireHoverChain(cell)
+      for (polls = 1; polls <= 10; polls++) {
+        await wait(200)
+        btn = findPostBtn(cell)
+        if (btn) break
+      }
+    }
+    if (!btn) {
+      const buttons = cell.querySelectorAll('button')
+      const summary = Array.from(buttons).map((b) => `class="${b.className.slice(0, 60)}" text="${(b.textContent || '').trim()}"`).join(' | ') || '(none)'
+      return { btn: null, uiKind: 'not-found', polls, reason: `Post button never found after ${polls} polls. Buttons: ${summary}` }
+    }
+
+    const isPhantom = btn.classList.contains('action-phantom')
+    if (isPhantom) {
+      log(`    [post-btn] phantom detected · starting Morpheus hydration loop (up to 5s)`)
+      // Aggressive hover + poll up to ~5s. Re-fire hover every 500ms so
+      // Morpheus sees a sustained mouse-in state (it sometimes drops state
+      // after a single hover event).
+      fireHoverChain(row)
+      fireHoverChain(cell)
+      fireHoverChain(btn)
+      for (let i = 0; i < 50; i++) {
+        if (i > 0 && i % 5 === 0) {
+          // Re-trigger hover periodically to keep Morpheus awake.
+          fireHoverChain(row)
+          fireHoverChain(cell)
+          const stillThere = findPostBtn(cell)
+          if (stillThere) fireHoverChain(stillThere)
+        }
+        await wait(100)
+        const fresh = findPostBtn(cell)
+        if (fresh && fresh.isConnected && !fresh.classList.contains('action-phantom')) {
+          log(`    [post-btn] hydrated after ${(i + 1) * 100}ms`)
+          return { btn: fresh, uiKind: 'old-phantom-hydrated', polls: polls + i + 1 }
+        }
+        if (fresh && fresh.isConnected) btn = fresh  // keep ref fresh
+      }
+      // Hydration timed out — return the latest phantom as a fallback. The
+      // caller will try clicking it; on some builds the phantom's onClick
+      // triggers Morpheus to load AND fire the action in one go.
+      if (!btn || !btn.isConnected) {
+        return { btn: null, uiKind: 'phantom-vanished', polls, reason: 'phantom Post button gone after 5s hover' }
+      }
+      log(`    [post-btn] WARN: never hydrated after 5s · falling back to phantom click`)
+      return { btn, uiKind: 'old-phantom-still-phantom', polls }
+    }
+    // New ComboLink — NO hover (mirrors Match path).
+    return { btn, uiKind: 'new-combolink', polls }
+  }
+
+  function dispatchFullClick(btn: HTMLButtonElement) {
+    const o = mkPointerOpts(btn)
+    btn.dispatchEvent(new PointerEvent('pointerdown', o))
+    btn.dispatchEvent(new MouseEvent('mousedown', o))
+    btn.dispatchEvent(new PointerEvent('pointerup', o))
+    btn.dispatchEvent(new MouseEvent('mouseup', o))
+    btn.dispatchEvent(new MouseEvent('click', o))
+    try { btn.click() } catch {}
+  }
+
+  // Click Post. Returns true if the row disappears or Pending count drops.
+  //
+  // Strategy mirrors activateAndClickMatch (which works) + adds:
+  //   1. A 1500ms server-commit wait BEFORE locating the button. The category
+  //      save fires an async server call; if Post is clicked before that
+  //      commit lands, QBO's onClick handler silently no-ops because the row
+  //      isn't in a postable state yet. This is the key reason Post failed
+  //      while Match worked (Match has no preceding state change).
+  //   2. A one-shot retry. If the first click doesn't confirm in ~3s, re-find
+  //      the button (it may have been swapped by re-render) and click again.
   async function clickPostAndVerify(row: HTMLElement): Promise<{ ok: boolean; error: string | null }> {
     const cell = row.querySelector<HTMLElement>('.idsTable__cell.action')
     if (!cell) {
@@ -1250,52 +1315,68 @@ async function applyCategoriesInPage(
     // can swallow the Post click otherwise.
     await waitForListboxClosed()
 
-    // Wait for the action cell to settle after the category-save re-render.
-    const btn = await waitForStablePostBtn(cell, row)
-    if (!btn) {
-      log(`    [post] FAIL: post button not found`)
-      return { ok: false, error: 'post button not found' }
-    }
-    if (!btn.isConnected) {
-      log(`    [post] FAIL: post button detached before click`)
-      return { ok: false, error: 'post button detached before click' }
-    }
+    // CRITICAL: Wait for QBO to commit the category change server-side. Without
+    // this delay the Post click is silently ignored on most rows.
+    log(`    [post] waiting 1500ms for QBO server-side category commit`)
+    await wait(1500)
 
-    const label = (btn.textContent || '').trim()
     const pendingBefore = getPendingCount()
-    log(`    [post] clicking "${label}" · pendingBefore=${pendingBefore ?? '?'}`)
 
-    const o = mkPointerOpts(btn)
-    btn.dispatchEvent(new PointerEvent('pointerdown', o))
-    btn.dispatchEvent(new MouseEvent('mousedown', o))
-    await wait(50)
-    btn.dispatchEvent(new PointerEvent('pointerup', o))
-    btn.dispatchEvent(new MouseEvent('mouseup', o))
-    btn.dispatchEvent(new MouseEvent('click', o))
-    try { btn.click() } catch {}
-
-    // QBO removes the row OR drops the Pending count once Post succeeds.
-    // Poll for up to ~8s — slow COAs or laggy QBO can take 5-7s.
-    for (let i = 0; i < 64; i++) {
-      await wait(125)
-      if (!row.isConnected) {
-        log(`    [post] CONFIRMED · row detached after ${i * 125}ms`)
+    const tryClick = async (attempt: number, confirmMs: number): Promise<{ ok: boolean; error: string | null; uiKind?: string }> => {
+      const live = row.isConnected ? row : null
+      if (!live) {
+        // Row already detached — assume success (Post already fired).
+        log(`    [post] row detached before attempt ${attempt} click — treating as success`)
         return { ok: true, error: null }
       }
-      if (pendingBefore != null) {
-        const now = getPendingCount()
-        if (now != null && now < pendingBefore) {
-          log(`    [post] CONFIRMED · pending ${pendingBefore}→${now} after ${i * 125}ms`)
-          return { ok: true, error: null }
+      const liveCell = live.querySelector<HTMLElement>('.idsTable__cell.action')
+      if (!liveCell) return { ok: false, error: 'action cell lost between attempts' }
+
+      const prep = await locateAndPrepPostBtn(liveCell, live)
+      if (!prep.btn) {
+        log(`    [post] attempt ${attempt} FAIL: ${prep.reason ?? prep.uiKind}`)
+        return { ok: false, error: prep.reason ?? `Post button not found (${prep.uiKind})` }
+      }
+      const label = (prep.btn.textContent || '').trim()
+      log(`    [post] attempt ${attempt} clicking "${label}" via ${prep.uiKind} (polls=${prep.polls})`)
+      dispatchFullClick(prep.btn)
+
+      const ticks = Math.ceil(confirmMs / 125)
+      for (let i = 0; i < ticks; i++) {
+        await wait(125)
+        if (!row.isConnected) {
+          log(`    [post] CONFIRMED · row detached after ${i * 125}ms (attempt ${attempt})`)
+          return { ok: true, error: null, uiKind: prep.uiKind }
+        }
+        if (pendingBefore != null) {
+          const now = getPendingCount()
+          if (now != null && now < pendingBefore) {
+            log(`    [post] CONFIRMED · pending ${pendingBefore}→${now} after ${i * 125}ms (attempt ${attempt})`)
+            return { ok: true, error: null, uiKind: prep.uiKind }
+          }
         }
       }
+      log(`    [post] attempt ${attempt} not confirmed in ${confirmMs}ms`)
+      return { ok: false, error: `attempt ${attempt} (${prep.uiKind}): click landed but not confirmed`, uiKind: prep.uiKind }
     }
+
+    // Attempt 1: 8s confirmation window — phantom click may need to trigger
+    // Morpheus load + server-side action in series, which is slower than the
+    // hydrated path.
+    const first = await tryClick(1, 8000)
+    if (first.ok) return first
+
+    // If first attempt was a phantom fallback click, Morpheus may have hydrated
+    // by now — retry will pick up the real button. Wait 1s for re-render.
+    log(`    [post] retrying after 1000ms (first attempt uiKind=${first.uiKind ?? 'unknown'})`)
+    await wait(1000)
+    const second = await tryClick(2, 8000)
+    if (second.ok) return second
+
     const pendingAfter = getPendingCount()
-    log(`    [post] FAIL · pending ${pendingBefore ?? '?'}→${pendingAfter ?? '?'} · row ${row.isConnected ? 'still present' : 'detached'}`)
-    return {
-      ok: false,
-      error: `post not confirmed (button="${label}", pending ${pendingBefore ?? '?'}→${pendingAfter ?? '?'}, row ${row.isConnected ? 'still present' : 'detached'})`,
-    }
+    const finalErr = `post not confirmed after 2 attempts (pending ${pendingBefore ?? '?'}→${pendingAfter ?? '?'}, row ${row.isConnected ? 'still present' : 'detached'}, last="${second.error}")`
+    log(`    [post] FAIL · ${finalErr}`)
+    return { ok: false, error: finalErr }
   }
 
   // Dismiss any open listbox so the next row's interaction starts clean. We
@@ -1349,13 +1430,27 @@ async function applyCategoriesInPage(
     error: string | null
   }[] = []
 
-  for (const s of suggestions) {
+  // Helper: do the full Post phase for a row whose category is already set.
+  // Used for both the normal flow and the retry-on-already-categorized path.
+  async function postRow(
+    row: HTMLElement,
+    s: typeof suggestions[number],
+  ): Promise<{ ok: boolean; error: string | null }> {
+    await waitForListboxClosed()
+    // Re-resolve once more — category save may have re-rendered the row.
+    const fresh = await ensureRowVisible(s.rowIndex, { date: s.date, description: s.description, spent: s.spent, received: s.received }) ?? row
+    return clickPostAndVerify(fresh)
+  }
+
+  for (let sIdx = 0; sIdx < suggestions.length; sIdx++) {
+    const s = suggestions[sIdx]
     assertNotStopped()
-    log(`→ APPLY row#${s.rowIndex} | ${s.date} "${s.description}" | spent=${s.spent || '-'} received=${s.received || '-'} | suggest="${s.suggestedCategory}" (catId=${s.categoryId ?? 'null'})`)
+    log(`═══════════════════════════════════════════════════════════`)
+    log(`→ APPLY ${sIdx + 1}/${suggestions.length} row#${s.rowIndex} | ${s.date} "${s.description}" | spent=${s.spent || '-'} received=${s.received || '-'} | suggest="${s.suggestedCategory}" (catId=${s.categoryId ?? 'null'})`)
 
     // Re-resolve the row by aria-rowindex right before each operation. The previous
     // apply may have triggered a re-render, so a cached reference could be stale.
-    let row = await ensureRowVisible(s.rowIndex, { date: s.date, description: s.description, spent: s.spent, received: s.received })
+    const row = await ensureRowVisible(s.rowIndex, { date: s.date, description: s.description, spent: s.spent, received: s.received })
     if (!row) {
       log(`  ✗ row not found even after scrolling`)
       events.push({ rowIndex: s.rowIndex, status: 'failed', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'row not found' })
@@ -1363,27 +1458,39 @@ async function applyCategoriesInPage(
     }
     log(`  row visible`)
 
+    // Branch on row's current category state.
     if (!isUncategorized(row)) {
-      // QBO may have already categorized this row (auto-suggested from a sibling
-      // we just applied). Treat as success if the current category matches our
-      // suggestion; otherwise log the actual disagreement.
       const current = readCurrentCategory(row)
-      if (current && current.trim().toLowerCase() === s.suggestedCategory.trim().toLowerCase()) {
-        log(`  ✓ already categorized as "${current}" (matches suggestion — auto-applied by QBO)`)
-        events.push({ rowIndex: s.rowIndex, status: 'applied', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'auto-applied by QBO' })
-      } else {
-        log(`  ✗ row already categorized · current="${current}" ≠ suggest="${s.suggestedCategory}"`)
-        events.push({
-          rowIndex: s.rowIndex,
-          status: 'failed',
-          suggestedCategory: s.suggestedCategory,
-          categoryId: s.categoryId,
-          error: current ? `pre-categorized as "${current}"` : 'row already categorized',
-        })
+      const wantedLower = s.suggestedCategory.trim().toLowerCase()
+      const matches = !!current && current.trim().toLowerCase() === wantedLower
+      if (matches) {
+        // Row is already categorized with our suggestion. This happens when:
+        //   - Pass 1 set the category but Post timed out → pass 2 retry
+        //   - QBO auto-categorized a sibling row when we applied another
+        // Either way: skip the dropdown and go straight to Post.
+        log(`  → already categorized as "${current}" — skipping dropdown, going to Post`)
+        const post = await postRow(row, s)
+        if (post.ok) {
+          log(`  ✓ APPLIED row#${s.rowIndex} (Post-only path)`)
+          events.push({ rowIndex: s.rowIndex, status: 'applied', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'category was already set' })
+        } else {
+          log(`  ⚠ category was already set but post still failed · ${post.error}`)
+          events.push({ rowIndex: s.rowIndex, status: 'failed', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: `post failed (already-categorized path): ${post.error}` })
+        }
+        continue
       }
+      log(`  ✗ row pre-categorized as "${current}" ≠ suggest="${s.suggestedCategory}" — not touching`)
+      events.push({
+        rowIndex: s.rowIndex,
+        status: 'failed',
+        suggestedCategory: s.suggestedCategory,
+        categoryId: s.categoryId,
+        error: current ? `pre-categorized as "${current}"` : 'row already categorized',
+      })
       continue
     }
 
+    // Normal path: row is uncategorized → open dropdown, select, save, Post.
     const panel = await openDropdown(row, s.suggestedCategory)
     if (!panel) {
       log(`  ✗ dropdown did not open`)
@@ -1401,8 +1508,8 @@ async function applyCategoriesInPage(
     log(`  option clicked · verifying save`)
 
     // Re-resolve the row again — option click can detach the original element.
-    row = await ensureRowVisible(s.rowIndex, { date: s.date, description: s.description, spent: s.spent, received: s.received }) ?? row
-    const ok = await verifySaved(row)
+    const savedRow = await ensureRowVisible(s.rowIndex, { date: s.date, description: s.description, spent: s.spent, received: s.received }) ?? row
+    const ok = await verifySaved(savedRow)
     if (!ok) {
       log(`  ✗ save not confirmed`)
       events.push({ rowIndex: s.rowIndex, status: 'failed', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'save not confirmed' })
@@ -1410,23 +1517,28 @@ async function applyCategoriesInPage(
       continue
     }
 
-    // Close any open listbox before clicking Post.
-    await waitForListboxClosed()
-
-    // Re-resolve once more — the category save may have re-rendered the row.
-    row = await ensureRowVisible(s.rowIndex, { date: s.date, description: s.description, spent: s.spent, received: s.received }) ?? row
-    const post = await clickPostAndVerify(row)
+    const post = await postRow(savedRow, s)
     if (post.ok) {
-      log(`  ✓ APPLIED row#${s.rowIndex}`)
+      log(`  ✓ APPLIED row#${s.rowIndex} (full path)`)
       events.push({ rowIndex: s.rowIndex, status: 'applied', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: null })
     } else {
-      // Category is set in QBO but the row wasn't posted. Still a partial success
-      // — surface the post failure so the audit log captures it.
-      log(`  ⚠ category set but post failed · ${post.error}`)
-      events.push({ rowIndex: s.rowIndex, status: 'applied', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: `category set, post failed: ${post.error}` })
+      // Mark as FAILED (not applied) so runJob's retry pass picks it up. The
+      // retry will detect the row is already categorized correctly and skip
+      // straight to the Post phase.
+      log(`  ⚠ category set but post failed · ${post.error} · will be retried on pass 2`)
+      events.push({ rowIndex: s.rowIndex, status: 'failed', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: `category set, post failed: ${post.error}` })
+    }
+
+    // Settle between rows so QBO can finish any in-flight server work before
+    // we touch the next row. Cheap insurance — the visible per-row sequence
+    // also makes it easier to follow what's happening.
+    if (sIdx < suggestions.length - 1) {
+      log(`  ── settling 800ms before next row ──`)
+      await wait(800)
     }
   }
 
+  log(`═══════════════════════════════════════════════════════════`)
   log(`apply DONE · ${events.filter((e) => e.status === 'applied').length}/${events.length} applied`)
   return { events, logs }
 }
