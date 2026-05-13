@@ -1,5 +1,6 @@
 import { DEFAULT_SETTINGS } from '../types'
-import type { JobResult, PageResult, RunState, Settings } from '../types'
+import type { ApplyEvent, JobResult, PageResult, RunState, Settings, Suggestion } from '../types'
+import { resolveClinic } from './clinic-resolver'
 
 const QBO_TARGETS: Record<Settings['qboEnvironment'], { openUrl: string; tabMatchUrl: string; label: string }> = {
   sandbox: {
@@ -108,6 +109,8 @@ function makeInProgressResult(trigger: 'manual' | 'scheduled'): JobResult {
     matchedCount: 0,
     uncategorizedSent: 0,
     skippedCount: 0,
+    appliedCount: 0,
+    applyFailedCount: 0,
     backendStatus: 'running',
   }
 }
@@ -216,6 +219,33 @@ async function inPageWorker(): Promise<PageResult> {
   }
   const text = (el: Element | null | undefined) => el?.textContent?.trim() ?? ''
 
+  function readRealmId(): string | null {
+    // 1. Query param on the banking URL
+    const url = new URL(location.href)
+    const fromQuery = url.searchParams.get('realmId')
+    if (fromQuery) return fromQuery
+    // 2. window.qboeUser?.realm (some QBO builds)
+    const w = window as unknown as { qboeUser?: { realm?: string | number } }
+    const fromGlobal = w.qboeUser?.realm
+    if (fromGlobal != null) return String(fromGlobal)
+    // 3. Cookies — this build of QBO stores it as qbo.currentcompanyid
+    const cookies = document.cookie.split(';').map((c) => c.trim())
+    for (const c of cookies) {
+      const eq = c.indexOf('=')
+      if (eq < 0) continue
+      const name = c.slice(0, eq)
+      const value = decodeURIComponent(c.slice(eq + 1))
+      if (name === 'qbo.currentcompanyid' && /^\d+$/.test(value)) return value
+      // 4. Fallback: shell.ctx.id has format "authId=...&companyId=..."
+      if (name === 'shell.ctx.id') {
+        const m = value.match(/companyId=(\d+)/)
+        if (m) return m[1]
+      }
+    }
+    return null
+  }
+  const realmId = readRealmId()
+
   // ── Logging ──────────────────────────────────────────────────────────────────
   const logs: string[] = []
   const log = (msg: string) => {
@@ -225,6 +255,7 @@ async function inPageWorker(): Promise<PageResult> {
   }
 
   log(`worker v1.8 started · url=${location.href}`)
+  log(`realmId=${realmId ?? '(none)'}`)
 
   // Bail early if not on the banking page
   if (!location.href.includes('/app/banking')) {
@@ -232,6 +263,7 @@ async function inPageWorker(): Promise<PageResult> {
     return {
       loggedIn: false,
       url: location.href,
+      realmId,
       totalRows: 0,
       autoMatched: [],
       uncategorized: [],
@@ -252,6 +284,7 @@ async function inPageWorker(): Promise<PageResult> {
     return {
       loggedIn: false,
       url: location.href,
+      realmId,
       totalRows: 0,
       autoMatched: [],
       uncategorized: [],
@@ -427,8 +460,25 @@ async function inPageWorker(): Promise<PageResult> {
 
     const categoryCell = cell('category')
     const matchInfo = text(categoryCell?.querySelector('.matchedInvoicedText'))
-    const categoryLabel =
-      categoryCell?.querySelector<HTMLButtonElement>('.qbo-quickfills-ui-account')?.getAttribute('aria-label') ?? ''
+    // Category label in the new redesign-enabled-qf UI lives in one of two places:
+    //   1. Phantom button aria-label: <button class="QuickfillsPhantom qbo-quickfills-ui-account" aria-label="Uncategorized Income">
+    //   2. Hydrated container data-props JSON: <div class="QuickfillsContainer" data-props='{"placeholder":"Uncategorized Income",...}'>
+    const phantomCatBtn = categoryCell?.querySelector<HTMLButtonElement>(
+      '.QuickfillsPhantom.qbo-quickfills-ui-account',
+    )
+    let categoryLabel = phantomCatBtn?.getAttribute('aria-label') ?? ''
+    if (!categoryLabel) {
+      const container = categoryCell?.querySelector<HTMLElement>('.QuickfillsContainer[data-props]')
+      const raw = container?.getAttribute('data-props')
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw)
+          if (typeof parsed?.placeholder === 'string') categoryLabel = parsed.placeholder
+        } catch {
+          // ignore
+        }
+      }
+    }
     // Determine action — handles both old phantom UI and new ComboLink UI
     let action = ''
     const actionCell = cell('action')
@@ -703,12 +753,491 @@ async function inPageWorker(): Promise<PageResult> {
   return {
     loggedIn: true,
     url: location.href,
+    realmId,
     totalRows,
     autoMatched,
     uncategorized: uncategorizedAll,
     skipped: skippedAll,
     logs,
   }
+}
+
+async function applyCategoriesInPage(
+  suggestions: {
+    rowIndex: string
+    suggestedCategory: string
+    categoryId: string | null
+    // Stable per-row identifiers from the original scrape — used to find the
+    // row even if QBO has re-rendered and reshuffled aria-rowindex (which
+    // happens after the Match auto-click pass at the start of the run).
+    date: string
+    description: string
+    spent: string
+    received: string
+  }[]
+): Promise<{
+  rowIndex: string
+  status: 'applied' | 'failed'
+  suggestedCategory: string
+  categoryId: string | null
+  error: string | null
+}[]> {
+  const pageWindow = window as Window & typeof globalThis & { __qboCategorizerStop?: boolean }
+  const assertNotStopped = () => {
+    if (pageWindow.__qboCategorizerStop) throw new Error('QBO_CATEGORIZER_STOPPED')
+  }
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+  const wait = async (ms: number) => {
+    const started = Date.now()
+    while (Date.now() - started < ms) {
+      assertNotStopped()
+      await sleep(Math.min(250, ms - (Date.now() - started)))
+    }
+    assertNotStopped()
+  }
+  const text = (el: Element | null | undefined) => el?.textContent?.trim() ?? ''
+
+  function findRowByRowIndex(rowIndex: string): HTMLElement | null {
+    const rows = document.querySelectorAll<HTMLElement>('#table-body-main tbody .idsTable__row')
+    for (const row of Array.from(rows)) {
+      const idx = row.getAttribute('aria-rowindex') ?? row.dataset.index ?? ''
+      if (idx === rowIndex) return row
+    }
+    return null
+  }
+
+  function findRowByContent(target: {
+    date: string
+    description: string
+    spent: string
+    received: string
+  }): HTMLElement | null {
+    const norm = (s: string) => s.replace(/\s+/g, '')
+    const rows = document.querySelectorAll<HTMLElement>('#table-body-main tbody .idsTable__row')
+    for (const row of Array.from(rows)) {
+      const date = (row.querySelector('.txnDate')?.textContent ?? '').trim()
+      const desc = (row.querySelector('.description-tooltip')?.textContent ?? '').trim()
+      const spent = norm(row.querySelector('.spent .pull-right')?.textContent ?? '')
+      const received = norm(row.querySelector('.received-amount')?.textContent ?? '')
+      if (
+        date === target.date &&
+        desc === target.description &&
+        spent === norm(target.spent) &&
+        received === norm(target.received)
+      ) {
+        return row
+      }
+    }
+    return null
+  }
+
+  async function ensureRowVisible(
+    rowIndex: string,
+    content?: { date: string; description: string; spent: string; received: string },
+  ): Promise<HTMLElement | null> {
+    const sc = document.querySelector<HTMLElement>('.ids-table__virtualized-container')
+    if (!sc) return null
+
+    // Lookup helper that prefers content-match (stable across re-renders) but
+    // falls back to aria-rowindex when content isn't provided.
+    const lookup = (): HTMLElement | null =>
+      (content ? findRowByContent(content) : null) ?? findRowByRowIndex(rowIndex)
+
+    let row = lookup()
+    if (row) {
+      row.scrollIntoView({ block: 'center', behavior: 'auto' })
+      await wait(180)
+      return lookup() ?? row
+    }
+    sc.scrollTop = 0
+    await wait(220)
+    const step = Math.max(120, Math.floor(sc.clientHeight * 0.6))
+    for (let attempt = 0; attempt < 40; attempt++) {
+      row = lookup()
+      if (row) {
+        row.scrollIntoView({ block: 'center', behavior: 'auto' })
+        await wait(220)
+        return lookup() ?? row
+      }
+      const atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 5
+      if (atBottom) break
+      sc.scrollTop = Math.min(sc.scrollHeight, sc.scrollTop + step)
+      await wait(180)
+    }
+    return null
+  }
+
+  // QBO redesign-enabled-qf UI has two states for the category cell:
+  //   1. Phantom: <button class="QuickfillsPhantom qbo-quickfills-ui-account"
+  //              aria-label="Uncategorized Income">...</button>
+  //   2. Hydrated: <div class="QuickfillsContainer" data-props='{"placeholder":"Uncategorized Income",...}'>
+  //              with an <input aria-label="Select category">
+  function phantomCategoryButton(row: HTMLElement): HTMLButtonElement | null {
+    return row.querySelector<HTMLButtonElement>(
+      '.category .QuickfillsPhantom.qbo-quickfills-ui-account',
+    )
+  }
+
+  function hydratedCategoryContainer(row: HTMLElement): HTMLElement | null {
+    return row.querySelector<HTMLElement>('.category .QuickfillsContainer[data-props]')
+  }
+
+  function readPlaceholderFromDataProps(container: HTMLElement): string {
+    const raw = container.getAttribute('data-props')
+    if (!raw) return ''
+    try {
+      const parsed = JSON.parse(raw)
+      return typeof parsed?.placeholder === 'string' ? parsed.placeholder : ''
+    } catch {
+      return ''
+    }
+  }
+
+  // The category cell goes through three DOM states:
+  //   1. Phantom (uncategorized):   .QuickfillsPhantom.qbo-quickfills-ui-account
+  //   2. Hydrated typeahead-open:   .QuickfillsContainer[data-props]
+  //   3. Categorized (post-click):  bare .qbo-quickfills-ui-account (no Phantom)
+  function bareCategoryButton(row: HTMLElement): HTMLButtonElement | null {
+    return row.querySelector<HTMLButtonElement>(
+      '.category .qbo-quickfills-ui-account:not(.QuickfillsPhantom)',
+    )
+  }
+
+  function isUncategorized(row: HTMLElement): boolean {
+    const phantom = phantomCategoryButton(row)
+    if (phantom) {
+      const label = phantom.getAttribute('aria-label') ?? ''
+      return /^Uncategorized\s+(Expense|Income)$/i.test(label)
+    }
+    const container = hydratedCategoryContainer(row)
+    if (container) {
+      const placeholder = readPlaceholderFromDataProps(container)
+      return /^Uncategorized\s+(Expense|Income)$/i.test(placeholder)
+    }
+    const bare = bareCategoryButton(row)
+    if (bare) {
+      const label = bare.getAttribute('aria-label') ?? ''
+      return /^Uncategorized\s+(Expense|Income)$/i.test(label)
+    }
+    return false
+  }
+
+  // Returns the row's current category name. Empty string if cell shows
+  // "Uncategorized …" or is unreadable. Used to distinguish QBO's side-effect
+  // categorization (auto-applied to similar-vendor rows) from a real failure.
+  function readCurrentCategory(row: HTMLElement): string {
+    const phantom = phantomCategoryButton(row)
+    if (phantom) {
+      const label = phantom.getAttribute('aria-label') ?? ''
+      return /^Uncategorized\s+(Expense|Income)$/i.test(label) ? '' : label
+    }
+    const container = hydratedCategoryContainer(row)
+    if (container) {
+      const placeholder = readPlaceholderFromDataProps(container)
+      if (placeholder && !/^Uncategorized\s+(Expense|Income)$/i.test(placeholder)) {
+        return placeholder
+      }
+    }
+    const bare = bareCategoryButton(row)
+    if (bare) {
+      const label = bare.getAttribute('aria-label') ?? ''
+      if (label && !/^Uncategorized\s+(Expense|Income)$/i.test(label)) return label
+      const txt = bare.textContent?.trim() ?? ''
+      if (txt && !/^Uncategorized\s+(Expense|Income)$/i.test(txt)) return txt
+    }
+    const input = row.querySelector<HTMLInputElement>(
+      '.category input[aria-label="Select category"]',
+    )
+    if (input?.value) return input.value.trim()
+    return ''
+  }
+
+  async function openDropdown(row: HTMLElement): Promise<HTMLElement | null> {
+    // Step 1: if phantom button is present, click to hydrate into the typeahead.
+    const phantom = phantomCategoryButton(row)
+    if (phantom) {
+      phantom.click()
+      await wait(700)
+    }
+
+    // Step 2: find the typeahead input.
+    let input: HTMLInputElement | null =
+      row.querySelector('input[aria-label="Select category"]') as HTMLInputElement | null
+    for (let i = 0; i < 10 && !input; i++) {
+      await wait(120)
+      input =
+        (row.querySelector('input[aria-label="Select category"]') as HTMLInputElement | null) ??
+        (document.querySelector('input[aria-label="Select category"]') as HTMLInputElement | null)
+    }
+    if (!input) return null
+
+    // Step 3: click + focus opens the listbox (input event alone does nothing).
+    input.focus()
+    input.click()
+
+    // Step 4: wait for the listbox to render.
+    for (let i = 0; i < 20; i++) {
+      const panel = document.querySelector<HTMLElement>('ul[role="listbox"]')
+      if (panel && panel.offsetParent !== null) return panel
+      await wait(120)
+    }
+    return null
+  }
+
+  async function selectCategoryOption(
+    panel: HTMLElement,
+    suggestion: { suggestedCategory: string; categoryId: string | null },
+  ): Promise<boolean> {
+    const targetLower = suggestion.suggestedCategory.trim().toLowerCase()
+    const normalize = (s: string) =>
+      s.toLowerCase().replace(/\s+/g, ' ').trim()
+    const targetNorm = normalize(suggestion.suggestedCategory)
+    const options = panel.querySelectorAll<HTMLElement>(
+      'li[role="option"].quickfillMenuItem',
+    )
+
+    // Pass 1: exact leaf-span match (most reliable).
+    for (const opt of Array.from(options)) {
+      for (const span of Array.from(opt.querySelectorAll<HTMLElement>('span'))) {
+        if (span.children.length > 0) continue
+        const txt = normalize(span.textContent ?? '')
+        if (txt === targetNorm || txt.toLowerCase() === targetLower) {
+          opt.click()
+          return true
+        }
+      }
+    }
+
+    // Pass 2: case-insensitive leaf-span "starts with" — QBO sometimes wraps
+    // names with type/parent suffixes inside a single span depending on locale
+    // (e.g., "Office Expenses & Supplies (Expense)").
+    for (const opt of Array.from(options)) {
+      for (const span of Array.from(opt.querySelectorAll<HTMLElement>('span'))) {
+        if (span.children.length > 0) continue
+        const txt = normalize(span.textContent ?? '')
+        if (txt.startsWith(targetNorm)) {
+          opt.click()
+          return true
+        }
+      }
+    }
+
+    // Pass 3: any element inside the LI whose direct text equals the target.
+    for (const opt of Array.from(options)) {
+      for (const el of Array.from(opt.querySelectorAll<HTMLElement>('*'))) {
+        if (el.children.length > 0) continue
+        const txt = normalize(el.textContent ?? '')
+        if (txt === targetNorm) {
+          opt.click()
+          return true
+        }
+      }
+    }
+
+    return false
+  }
+
+  async function verifySaved(row: HTMLElement): Promise<boolean> {
+    // QBO can take 3-4s to confirm a category change in the For Review row,
+    // especially on larger COAs. Poll for up to 6s.
+    for (let i = 0; i < 50; i++) {
+      if (!isUncategorized(row)) return true
+      await wait(120)
+    }
+    return false
+  }
+
+  function mkPointerOpts(el: HTMLElement): MouseEventInit & PointerEventInit {
+    const r = el.getBoundingClientRect()
+    return {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      button: 0,
+      buttons: 1,
+      clientX: r.left + r.width / 2,
+      clientY: r.top + r.height / 2,
+      composed: true,
+      pointerType: 'mouse',
+      pointerId: 1,
+      isPrimary: true,
+    }
+  }
+
+  function fireHoverChain(el: HTMLElement) {
+    const o = mkPointerOpts(el)
+    el.dispatchEvent(new PointerEvent('pointerover', o))
+    el.dispatchEvent(new MouseEvent('mouseover', o))
+    el.dispatchEvent(new PointerEvent('pointerenter', o))
+    el.dispatchEvent(new MouseEvent('mouseenter', o))
+    el.dispatchEvent(new PointerEvent('pointermove', o))
+    el.dispatchEvent(new MouseEvent('mousemove', o))
+  }
+
+  // QBO's "Post" action button lives in the same action cell as Match.
+  // Two UI variants — old phantom (.action-phantom.post-action) and new
+  // ComboLink (.idsLinkActionButton with text "Post").
+  function findPostBtn(cell: HTMLElement): HTMLButtonElement | null {
+    const phantom =
+      cell.querySelector<HTMLButtonElement>('.post-action:not(.action-phantom)') ??
+      cell.querySelector<HTMLButtonElement>('button.post-action') ??
+      cell.querySelector<HTMLButtonElement>('.post-action')
+    if (phantom) return phantom
+    const linkBtns = cell.querySelectorAll<HTMLButtonElement>('.idsLinkActionButton')
+    for (const b of Array.from(linkBtns)) {
+      if (/^Post$/i.test((b.textContent || '').trim())) return b
+    }
+    return null
+  }
+
+  // Click the row's Post action. Returns true if the row disappears from the
+  // table (= QBO accepted the post), false otherwise.
+  async function clickPostAndVerify(row: HTMLElement): Promise<{ ok: boolean; error: string | null }> {
+    const cell = row.querySelector<HTMLElement>('.idsTable__cell.action')
+    if (!cell) return { ok: false, error: 'no action cell' }
+
+    let btn = findPostBtn(cell)
+    if (!btn) {
+      // Phantom buttons hydrate on row hover. Wake it up and re-find.
+      fireHoverChain(row)
+      fireHoverChain(cell)
+      for (let i = 0; i < 8; i++) {
+        await wait(120)
+        btn = findPostBtn(cell)
+        if (btn) break
+      }
+    }
+    if (!btn) return { ok: false, error: 'post button not found' }
+
+    const isPhantom = btn.classList.contains('action-phantom')
+    if (isPhantom) {
+      // Old phantom UI: hover hand-off swaps the DOM element. Re-find after.
+      fireHoverChain(row)
+      fireHoverChain(cell)
+      fireHoverChain(btn)
+      for (let i = 0; i < 8; i++) {
+        await wait(80)
+        const fresh = findPostBtn(cell)
+        if (fresh && fresh.isConnected && !fresh.classList.contains('action-phantom')) {
+          btn = fresh
+          break
+        }
+        if (fresh && fresh.isConnected) btn = fresh
+      }
+      if (!btn || !btn.isConnected) return { ok: false, error: 'phantom post button vanished' }
+    }
+
+    const o = mkPointerOpts(btn)
+    btn.dispatchEvent(new PointerEvent('pointerdown', o))
+    btn.dispatchEvent(new MouseEvent('mousedown', o))
+    await wait(50)
+    btn.dispatchEvent(new PointerEvent('pointerup', o))
+    btn.dispatchEvent(new MouseEvent('mouseup', o))
+    btn.dispatchEvent(new MouseEvent('click', o))
+    try { btn.click() } catch {}
+
+    // QBO removes the row from the Pending list once Post succeeds.
+    // Poll for up to 4s for the row to detach.
+    for (let i = 0; i < 32; i++) {
+      await wait(125)
+      if (!row.isConnected) return { ok: true, error: null }
+    }
+    return { ok: false, error: 'post not confirmed (row still present)' }
+  }
+
+  // Click-outside to dismiss any open listbox so the next row's interaction starts clean.
+  // Waits up to 1.5s for [role="listbox"] to disappear from the document.
+  async function waitForListboxClosed(): Promise<void> {
+    // Best-effort: blur active element and click on a benign area.
+    try {
+      ;(document.activeElement as HTMLElement | null)?.blur?.()
+      document.body.click()
+    } catch {
+      // ignore
+    }
+    for (let i = 0; i < 15; i++) {
+      const panel = document.querySelector<HTMLElement>('ul[role="listbox"]')
+      if (!panel || panel.offsetParent === null) return
+      await wait(100)
+    }
+  }
+
+  const events: {
+    rowIndex: string
+    status: 'applied' | 'failed'
+    suggestedCategory: string
+    categoryId: string | null
+    error: string | null
+  }[] = []
+
+  for (const s of suggestions) {
+    assertNotStopped()
+
+    // Re-resolve the row by aria-rowindex right before each operation. The previous
+    // apply may have triggered a re-render, so a cached reference could be stale.
+    let row = await ensureRowVisible(s.rowIndex, { date: s.date, description: s.description, spent: s.spent, received: s.received })
+    if (!row) {
+      events.push({ rowIndex: s.rowIndex, status: 'failed', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'row not found' })
+      continue
+    }
+    if (!isUncategorized(row)) {
+      // QBO may have already categorized this row (auto-suggested from a sibling
+      // we just applied). Treat as success if the current category matches our
+      // suggestion; otherwise log the actual disagreement.
+      const current = readCurrentCategory(row)
+      if (current && current.trim().toLowerCase() === s.suggestedCategory.trim().toLowerCase()) {
+        events.push({ rowIndex: s.rowIndex, status: 'applied', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'auto-applied by QBO' })
+      } else {
+        events.push({
+          rowIndex: s.rowIndex,
+          status: 'failed',
+          suggestedCategory: s.suggestedCategory,
+          categoryId: s.categoryId,
+          error: current ? `pre-categorized as "${current}"` : 'row already categorized',
+        })
+      }
+      continue
+    }
+
+    const panel = await openDropdown(row)
+    if (!panel) {
+      events.push({ rowIndex: s.rowIndex, status: 'failed', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'dropdown did not open' })
+      continue
+    }
+
+    const picked = await selectCategoryOption(panel, s)
+    if (!picked) {
+      // Close any leftover listbox before moving on.
+      await waitForListboxClosed()
+      events.push({ rowIndex: s.rowIndex, status: 'failed', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'option not found' })
+      continue
+    }
+
+    // Re-resolve the row again — option click can detach the original element.
+    row = await ensureRowVisible(s.rowIndex, { date: s.date, description: s.description, spent: s.spent, received: s.received }) ?? row
+    const ok = await verifySaved(row)
+    if (!ok) {
+      events.push({ rowIndex: s.rowIndex, status: 'failed', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: 'save not confirmed' })
+      await waitForListboxClosed()
+      continue
+    }
+
+    // Close any open listbox before clicking Post.
+    await waitForListboxClosed()
+
+    // Re-resolve once more — the category save may have re-rendered the row.
+    row = await ensureRowVisible(s.rowIndex, { date: s.date, description: s.description, spent: s.spent, received: s.received }) ?? row
+    const post = await clickPostAndVerify(row)
+    if (post.ok) {
+      events.push({ rowIndex: s.rowIndex, status: 'applied', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: null })
+    } else {
+      // Category is set in QBO but the row wasn't posted. Still a partial success
+      // — surface the post failure so the audit log captures it.
+      events.push({ rowIndex: s.rowIndex, status: 'applied', suggestedCategory: s.suggestedCategory, categoryId: s.categoryId, error: `category set, post failed: ${post.error}` })
+    }
+  }
+
+  return events
 }
 
 // ── Job runner ────────────────────────────────────────────────────────────────
@@ -751,6 +1280,7 @@ async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
       details: {
         loggedIn: false,
         url: loadedTab.url ?? '',
+        realmId: null,
         totalRows: 0,
         autoMatched: [],
         uncategorized: [],
@@ -801,31 +1331,144 @@ async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
     })
   }
 
-  // Send uncategorized rows to backend
+  // Resolve clinic from realmId (extension-side cache + /clinics/by-realm/:realmId)
+  const resolved = await resolveClinic(
+    pageResult.realmId,
+    settings.apiBaseUrl,
+    settings.extensionApiKey,
+  )
+
+  let suggestions: Suggestion[] = []
   let backendStatus = 'no uncategorized rows to send'
   let uncategorizedSent = 0
+
   if (pageResult.uncategorized.length > 0) {
     if (run.stopRequested) return finalize({ start, trigger, error: 'Stopped', details: pageResult, backendStatus: 'stopped' })
-    try {
-      const res = await fetch(settings.backendUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          source: 'qbo-extractor',
-          qboEnvironment: settings.qboEnvironment,
-          trigger,
-          count: pageResult.uncategorized.length,
-          transactions: pageResult.uncategorized,
-        }),
-      })
-      if (res.ok) {
-        uncategorizedSent = pageResult.uncategorized.length
-        backendStatus = `OK — sent ${uncategorizedSent} uncategorized row(s)`
-      } else {
-        backendStatus = `Backend HTTP ${res.status}`
+    if (!resolved) {
+      backendStatus = pageResult.realmId
+        ? 'No BookKeep clinic matches this QBO company. Add it in BookKeep first.'
+        : 'realmId not found in QBO tab — cannot match to a clinic.'
+    } else {
+      try {
+        const res = await fetch(
+          `${settings.apiBaseUrl}/llm/qbo-suggest?clinic_slug=${encodeURIComponent(resolved.clinicSlug)}`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Extension-Api-Key': settings.extensionApiKey,
+            },
+            body: JSON.stringify({
+              clinic_slug: resolved.clinicSlug,
+              source: 'qbo-extractor',
+              qboEnvironment: settings.qboEnvironment,
+              trigger,
+              transactions: pageResult.uncategorized,
+            }),
+          },
+        )
+        if (res.ok) {
+          const json = await res.json()
+          suggestions = (json.suggestions ?? []) as Suggestion[]
+          uncategorizedSent = pageResult.uncategorized.length
+          backendStatus = `OK — ${uncategorizedSent} sent · ${suggestions.filter((s) => s.accepted).length} accepted`
+        } else {
+          backendStatus = `Backend HTTP ${res.status}`
+        }
+      } catch (e) {
+        backendStatus = `Backend error: ${(e as Error).message}`
       }
-    } catch (e) {
-      backendStatus = `Backend error: ${(e as Error).message}`
+    }
+  }
+
+  // ── Apply-back: drive QBO category dropdown for accepted suggestions ─────────
+  let appliedCount = 0
+  let applyFailedCount = 0
+  if (resolved && suggestions.length > 0) {
+    const accepted = suggestions.filter((s) => s.accepted)
+    if (accepted.length > 0 && !run.stopRequested && tab.id != null) {
+      // Enrich each accepted suggestion with the row content scraped earlier so
+      // applyCategoriesInPage can find the row by stable attributes (date +
+      // description + amounts) even after the Match auto-click pass has
+      // renumbered aria-rowindex values.
+      const enrich = (s: typeof accepted[number]) => {
+        const orig = pageResult.uncategorized.find((u) => u.rowIndex === s.rowIndex)
+        return {
+          rowIndex: s.rowIndex,
+          suggestedCategory: s.suggestedCategory,
+          categoryId: s.categoryId,
+          date: orig?.date ?? '',
+          description: orig?.description ?? '',
+          spent: orig?.spent ?? '',
+          received: orig?.received ?? '',
+        }
+      }
+
+      let events: ApplyEvent[] = []
+      try {
+        const [r1] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: applyCategoriesInPage,
+          args: [accepted.map(enrich)],
+        })
+        const firstPass = (r1?.result ?? []) as Omit<ApplyEvent, 'confidence' | 'source' | 'qboTransactionId'>[]
+        events = firstPass.map((e) => {
+          const s = accepted.find((x) => x.rowIndex === e.rowIndex)!
+          return { ...e, confidence: s.confidence, source: s.source, qboTransactionId: null }
+        })
+
+        // Retry-once for failures
+        const failures = events.filter((e) => e.status === 'failed')
+        if (failures.length > 0 && !run.stopRequested) {
+          await new Promise((r) => setTimeout(r, 500))
+          const retryEnriched = failures.map((e) => {
+            const orig = accepted.find((a) => a.rowIndex === e.rowIndex)
+            return enrich(orig!)
+          })
+          const [r2] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: applyCategoriesInPage,
+            args: [retryEnriched],
+          })
+          const retryPass = (r2?.result ?? []) as Omit<ApplyEvent, 'confidence' | 'source' | 'qboTransactionId'>[]
+          for (const retry of retryPass) {
+            const slot = events.findIndex((e) => e.rowIndex === retry.rowIndex)
+            if (slot >= 0) {
+              const s = accepted.find((x) => x.rowIndex === retry.rowIndex)!
+              events[slot] = { ...retry, confidence: s.confidence, source: s.source, qboTransactionId: null }
+            }
+          }
+        }
+      } catch (e) {
+        const msg = (e as Error).message
+        if (run.stopRequested || msg.includes('QBO_CATEGORIZER_STOPPED')) {
+          backendStatus = `${backendStatus} · apply stopped`
+        } else {
+          backendStatus = `${backendStatus} · apply error: ${msg}`
+        }
+      }
+
+      appliedCount = events.filter((e) => e.status === 'applied').length
+      applyFailedCount = events.filter((e) => e.status === 'failed').length
+
+      // POST audit log
+      if (events.length > 0) {
+        try {
+          await fetch(
+            `${settings.apiBaseUrl}/llm/qbo-applied?clinic_slug=${encodeURIComponent(resolved.clinicSlug)}`,
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Extension-Api-Key': settings.extensionApiKey,
+              },
+              body: JSON.stringify({ clinic_slug: resolved.clinicSlug, events }),
+            },
+          )
+        } catch (e) {
+          backendStatus = `${backendStatus} · audit POST failed: ${(e as Error).message}`
+        }
+      }
     }
   }
 
@@ -834,7 +1477,7 @@ async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
   const okMatched = pageResult.autoMatched.filter((m) => m.success).length
   notify(
     'QBO sync complete',
-    `${okMatched} matched · ${uncategorizedSent} sent to backend · ${pageResult.skipped.length} skipped`,
+    `${okMatched} matched · ${appliedCount} auto-applied · ${applyFailedCount} apply-failed · ${pageResult.skipped.length} skipped`,
   )
 
   return finalize({
@@ -844,6 +1487,8 @@ async function runJob(trigger: 'manual' | 'scheduled'): Promise<JobResult> {
     details: pageResult,
     backendStatus,
     uncategorizedSent,
+    appliedCount,
+    applyFailedCount,
   })
   } finally {
     if (activeRun?.id === run.id) activeRun = null
@@ -860,6 +1505,8 @@ function finalize({
   details,
   backendStatus,
   uncategorizedSent,
+  appliedCount,
+  applyFailedCount,
 }: {
   start: number
   trigger: 'manual' | 'scheduled'
@@ -867,6 +1514,8 @@ function finalize({
   details?: PageResult
   backendStatus?: string
   uncategorizedSent?: number
+  appliedCount?: number
+  applyFailedCount?: number
 }): JobResult {
   const result: JobResult = {
     ok: !error,
@@ -879,6 +1528,8 @@ function finalize({
     matchedCount: details?.autoMatched.filter((m) => m.success).length ?? 0,
     uncategorizedSent: uncategorizedSent ?? 0,
     skippedCount: details?.skipped.length ?? 0,
+    appliedCount: appliedCount ?? 0,
+    applyFailedCount: applyFailedCount ?? 0,
     backendStatus: backendStatus ?? (error ?? 'not run'),
     details,
   }
