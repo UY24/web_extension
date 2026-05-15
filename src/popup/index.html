@@ -424,9 +424,18 @@
 
     <div class="card">
       <h3>Bookkeep endpoint</h3>
-      <label class="field-label" for="backend-url">LLM categorization API</label>
+
+      <label class="field-label" for="api-base-url">API base URL</label>
+      <input id="api-base-url" type="url" placeholder="http://localhost:3001/api" />
+      <p class="helper">BookKeep backend base. Leave blank for local dev default.</p>
+
+      <label class="field-label" for="extension-api-key">Extension API key</label>
+      <input id="extension-api-key" type="password" placeholder="(matches backend EXTENSION_API_KEY)" autocomplete="off" />
+      <p class="helper">Shared secret with the BookKeep backend. Leave blank to use the default.</p>
+
+      <label class="field-label" for="backend-url">Legacy LLM endpoint</label>
       <input id="backend-url" type="url" placeholder="http://localhost:3001/api/llm/qbo-categorize" />
-      <p class="helper">Uncategorized QBO rows are sent here for LLM categorization.</p>
+      <p class="helper">Old <code>/qbo-categorize</code> URL — kept for backwards compatibility.</p>
     </div>
 
     <div>

@@ -1,4 +1,5 @@
 import type { JobResult, RunState, Settings } from '../types'
+import { DEFAULT_SETTINGS } from '../types'
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const btnRun = document.getElementById('btn-run') as HTMLButtonElement
@@ -13,6 +14,8 @@ const nextRunText = document.getElementById('next-run-text') as HTMLSpanElement
 const scheduleEnabled = document.getElementById('schedule-enabled') as HTMLInputElement
 const scheduleTime = document.getElementById('schedule-time') as HTMLInputElement
 const backendUrl = document.getElementById('backend-url') as HTMLInputElement
+const apiBaseUrl = document.getElementById('api-base-url') as HTMLInputElement
+const extensionApiKey = document.getElementById('extension-api-key') as HTMLInputElement
 const qboEnvSandbox = document.getElementById('qbo-env-sandbox') as HTMLInputElement
 const qboEnvProduction = document.getElementById('qbo-env-production') as HTMLInputElement
 let refreshTimer: number | undefined
@@ -94,6 +97,8 @@ function renderLastRun(lastRun: JobResult | null | undefined, nextRun: number | 
   const matchedClass = lastRun.matchedCount > 0 ? 'ok' : 'muted'
   const sentClass = lastRun.uncategorizedSent > 0 ? 'ok' : 'muted'
   const skippedClass = lastRun.skippedCount > 0 ? 'warn' : 'muted'
+  const appliedClass = lastRun.appliedCount > 0 ? 'ok' : 'muted'
+  const applyFailedClass = lastRun.applyFailedCount > 0 ? 'err' : 'muted'
 
   const triggerBadge =
     lastRun.trigger === 'scheduled'
@@ -110,6 +115,8 @@ function renderLastRun(lastRun: JobResult | null | undefined, nextRun: number | 
     <div class="stats">
       <div class="stat"><div class="num ${matchedClass}">${lastRun.matchedCount}</div><span class="lbl">matched</span></div>
       <div class="stat"><div class="num ${sentClass}">${lastRun.uncategorizedSent}</div><span class="lbl">sent</span></div>
+      <div class="stat"><div class="num ${appliedClass}">${lastRun.appliedCount}</div><span class="lbl">applied</span></div>
+      <div class="stat"><div class="num ${applyFailedClass}">${lastRun.applyFailedCount}</div><span class="lbl">apply-failed</span></div>
       <div class="stat"><div class="num ${skippedClass}">${lastRun.skippedCount}</div><span class="lbl">skipped</span></div>
     </div>
     <div class="meta">
@@ -146,6 +153,8 @@ function renderSettings(s: Settings) {
   scheduleEnabled.checked = s.scheduleEnabled
   scheduleTime.value = s.scheduleTime
   backendUrl.value = s.backendUrl
+  apiBaseUrl.value = s.apiBaseUrl
+  extensionApiKey.value = s.extensionApiKey
   qboEnvSandbox.checked = s.qboEnvironment !== 'production'
   qboEnvProduction.checked = s.qboEnvironment === 'production'
   btnOpen.textContent = s.qboEnvironment === 'production' ? 'Open Production QBO ↗' : 'Open Sandbox QBO ↗'
@@ -211,7 +220,9 @@ async function saveSettings() {
   const settings: Settings = {
     scheduleEnabled: scheduleEnabled.checked,
     scheduleTime: scheduleTime.value || '09:00',
-    backendUrl: backendUrl.value.trim() || 'http://localhost:3001/api/llm/qbo-categorize',
+    backendUrl: backendUrl.value.trim() || DEFAULT_SETTINGS.backendUrl,
+    apiBaseUrl: apiBaseUrl.value.trim() || DEFAULT_SETTINGS.apiBaseUrl,
+    extensionApiKey: extensionApiKey.value.trim() || DEFAULT_SETTINGS.extensionApiKey,
     qboEnvironment: qboEnvProduction.checked ? 'production' : 'sandbox',
   }
   await send({ type: 'SET_SETTINGS', settings })
@@ -256,6 +267,8 @@ btnOpen.addEventListener('click', async () => {
 scheduleEnabled.addEventListener('change', saveSettings)
 scheduleTime.addEventListener('change', saveSettings)
 backendUrl.addEventListener('change', saveSettings)
+apiBaseUrl.addEventListener('change', saveSettings)
+extensionApiKey.addEventListener('change', saveSettings)
 qboEnvSandbox.addEventListener('change', saveSettings)
 qboEnvProduction.addEventListener('change', saveSettings)
 
